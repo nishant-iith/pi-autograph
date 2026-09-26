@@ -219,6 +219,10 @@ export interface GoalGraphConfig {
     planCriticRepairsBeforeUltra: number;
     reviewerRepairCycles: number;
     auditRepairCycles: number;
+    /** Retries per worker on transient provider errors (429/50x/network). */
+    retryWorkerOnTransient: number;
+    /** Hard spend ceiling for a single goal; null = no budget guard. */
+    maxCostUsd: number | null;
   };
 }
 

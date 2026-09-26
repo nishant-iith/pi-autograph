@@ -1,0 +1,38 @@
+name: Bug report
+description: Something in pi-autograph misbehaved
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting. The more of this you include, the faster we can reproduce it.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: One clear recipe to reproduce it. What was your goal text, what happened, what did you expect.
+      placeholder: '/goal-direct ... at step X the run failed with ...'
+    validations: { required: true }
+  - type: textarea
+    id: state
+    attributes:
+      label: State / evidence
+      description: Dump .pi/goal-graph/<goal>/events.jsonl + evidence.jsonl (or the operative parts) if you can.
+      placeholder: paste .pi/goal-graph/... evidence here
+    validations: { required: false }
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: "OS, Node version, Pi version, NVIDIA model selectors"
+      placeholder: "windows 11, node 24, pi 0.86, nvidia/nvidia/nemotron-3-super-120b-a12b"
+    validations: { required: true }
+  - type: checkboxes
+    id: existing
+    attributes:
+      label: Reproduced?
+      options:
+        - label: I can reproduce this from a clean goal
+          required: false
+        - label: I confirmed there is no transient (429/5xx/network) provider error involved
+          required: false

@@ -127,6 +127,7 @@ export class GoalOrchestrator {
   private tools: ToolRegistry;
   private engine: DecisionEngine;
   private decisions: RunDecision[] = [];
+  private totalSpendUsd = 0;
 
   constructor(private readonly cwd: string, private readonly hooks: OrchestratorHooks = {}) {
     const base = ensureStore(cwd);
@@ -175,9 +176,11 @@ export class GoalOrchestrator {
       signal,
       timeoutMs: this.config.execution.commandTimeoutMs,
       settleGraceMs: this.config.execution.childSettleGraceMs,
+      maxRetries: this.config.execution.retryWorkerOnTransient,
       goalId: goal?.id,
       onProgress: (m) => this.hooks.log?.(`[${role}] ${shortText(m, 500)}`),
     });
+    this.totalSpendUsd += result.usage.cost ?? 0;
     if (goal) {
       const ref = archiveText(this.cwd, goal.id, `${role}-raw`, `${result.output}\n\nSTDERR:\n${result.stderr}`);
       addEvidence(this.cwd, goal.id, {
@@ -380,11 +383,23 @@ export class GoalOrchestrator {
     saveGoal(this.cwd, goal);
   }
 
+  private budgetHit(): boolean {
+    const cap = this.config.execution.maxCostUsd;
+    return cap != null && this.totalSpendUsd >= cap;
+  }
+
   private async executeDag(goal: GoalContract, signal?: AbortSignal): Promise<void> {
     let noProgress = 0;
     while (goal.tasks.some((t) => t.status === "pending" || t.status === "running")) {
       if (signal?.aborted) throw new Error("Goal paused");
       if (goal.status === "blocked") return;
+      if (this.budgetHit()) {
+        goal.status = "blocked";
+        goal.blockedReason = `Cost budget reached: $${this.totalSpendUsd.toFixed(4)} >= $${this.config.execution.maxCostUsd}. Raise execution.maxCostUsd via /goal-config to continue.`;
+        saveGoal(this.cwd, goal);
+        appendEvent(this.cwd, goal.id, "budget_blocked", { spend: this.totalSpendUsd, cap: this.config.execution.maxCostUsd });
+        return;
+      }
       const before = goal.tasks.filter((t) => t.status === "completed").length;
       const wave = buildWave(goal.tasks, this.config.parallel.maxConcurrency);
       if (!wave.length) {

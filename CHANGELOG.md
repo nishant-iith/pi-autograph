@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0 — 2026-09-27 — renamed pi-goal-graph → pi-autograph
+
+**New name:** `pi-autograph` — autonomous goal graph. (Package renamed; `/goal*` commands unchanged.)
+
+### Reliability
+- Worker now retries transient provider errors (429/50x/network) with exponential backoff before a
+  failure ever reaches the repair pipeline.
+- New `execution.retryWorkerOnTransient` (default 3).
+- New `execution.maxCostUsd` — a goal blocks with a clear reason instead of silently burning budget.
+- New optional `PI_GOAL_GRAPH_FAKE_PI` env test hook + `runPiAgent` `piInvocation` override so the
+  whole graph can run headless on any OS without a real pi install.
+
+### Cross-platform
+- Test suite now passes on Windows (was POSIX-only). 13/13 green.
+
+### Docs / contribution surface
+- Rewrote README for pi-autograph; added CONTRIBUTING.md, MIT LICENSE, GitHub Actions CI,
+  and issue templates.
+
 ## 0.4.0 — 2026-09-27
 
 - Rebuilt as an actual Pi Coding Agent TypeScript extension/package.

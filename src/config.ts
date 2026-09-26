@@ -40,6 +40,8 @@ export const DEFAULT_CONFIG: GoalGraphConfig = {
     planCriticRepairsBeforeUltra: 2,
     reviewerRepairCycles: 3,
     auditRepairCycles: 3,
+    retryWorkerOnTransient: 3,
+    maxCostUsd: null,
   },
 };
 

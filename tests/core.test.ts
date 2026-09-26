@@ -77,22 +77,26 @@ test("check auto-detection finds package scripts", () => {
 test("isolated Pi runner parses JSON event stream", async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "goal-runner-"));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), "goal-bin-"));
-  const fake = path.join(bin, "pi");
-  fs.writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"{\\"ok\\":true}"}],"usage":{"input":3,"output":4,"totalTokens":7},"stopReason":"stop"}}'\n`);
-  fs.chmodSync(fake, 0o755);
-  const oldPath = process.env.PATH;
-  const oldArgv1 = process.argv[1];
-  process.env.PATH = `${bin}:${oldPath}`;
-  process.argv[1] = path.join(cwd, "does-not-exist.js");
-  try {
-    const r = await runPiAgent({ cwd, role: "planner", task: "x", systemPrompt: "x", model: "fake/model", modelTier: "super", tools: [] });
-    assert.equal(r.exitCode, 0);
-    assert.equal(r.output, '{"ok":true}');
-    assert.equal(r.usage.contextTokens, 7);
-  } finally {
-    process.env.PATH = oldPath;
-    process.argv[1] = oldArgv1;
-  }
+  const fakeJs = path.join(bin, "fake-pi.cjs");
+  // build the event as a real object; JSON.stringify does the escaping (single-quote bugs otherwise)
+  const body = JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: '{"ok":true}' }],
+      usage: { input: 3, output: 4, totalTokens: 7 },
+      stopReason: "stop",
+    },
+  });
+  fs.writeFileSync(fakeJs, `console.log(${JSON.stringify(body)});\n`);
+  const r = await runPiAgent({
+    cwd, role: "planner", task: "x", systemPrompt: "x",
+    model: "fake/model", modelTier: "super", tools: [],
+    piInvocation: { command: process.execPath, args: [fakeJs] },
+  });
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.output, '{"ok":true}');
+  assert.equal(r.usage.contextTokens, 7);
 });
 
 test("extension registers expected Pi commands", () => {
@@ -133,48 +137,102 @@ test("context pruner reversibly spills oversized tool results", () => {
 test("isolated Pi runner reaps a settled child that keeps handles open", async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "goal-runner-settled-"));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), "goal-bin-settled-"));
-  const fake = path.join(bin, "pi");
-  fs.writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"totalTokens":5},"stopReason":"stop"}}'\nprintf '%s\\n' '{"type":"agent_settled"}'\nsleep 5\n`);
-  fs.chmodSync(fake, 0o755);
-  const oldPath = process.env.PATH;
-  const oldArgv1 = process.argv[1];
-  process.env.PATH = `${bin}:${oldPath}`;
-  process.argv[1] = path.join(cwd, "does-not-exist.js");
+  const fakeJs = path.join(bin, "fake-pi-settled.cjs");
+  // keep the event loop alive after emit, simulating a leaked third-party extension handle
+  fs.writeFileSync(fakeJs, [
+    'console.log(\'{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"totalTokens":5},"stopReason":"stop"}}\');',
+    'console.log(\'{"type":"agent_settled"}\');',
+    'setInterval(() => {}, 1000);',
+  ].join("\n"));
   const started = Date.now();
-  try {
-    const r = await runPiAgent({ cwd, role: "coder", task: "x", systemPrompt: "x", model: "fake/model", modelTier: "super", tools: [], settleGraceMs: 500, timeoutMs: 3000 });
-    assert.equal(r.exitCode, 0);
-    assert.equal(r.output, "done");
-    assert.ok(Date.now() - started < 2800, "settled child was not reaped promptly");
-  } finally {
-    process.env.PATH = oldPath;
-    process.argv[1] = oldArgv1;
-  }
+  const r = await runPiAgent({
+    cwd, role: "coder", task: "x", systemPrompt: "x",
+    model: "fake/model", modelTier: "super", tools: [],
+    settleGraceMs: 500, timeoutMs: 3000,
+    piInvocation: { command: process.execPath, args: [fakeJs] },
+  });
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.output, "done");
+  assert.ok(Date.now() - started < 3000, "settled child was not reaped promptly");
 });
 
+
+test("worker retries transient provider errors with backoff", async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "goal-retry-"));
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "goal-retry-bin-"));
+  const fakeJs = path.join(bin, "fake-flaky.cjs");
+  const body = JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: '{"ok":true}' }], usage: { totalTokens: 3 }, stopReason: "stop" },
+  });
+  fs.writeFileSync(fakeJs, [
+    'const fs=require("fs"); const pathmod=require("path");',
+    'const cf=pathmod.join(__dirname,"c.txt");',
+    'let n=0; try{n=parseInt(fs.readFileSync(cf,"utf8")||"0");}catch{}',
+    'fs.writeFileSync(cf,String(n+1));',
+    'if(n<2){ console.error("HTTP 504 gateway timeout"); process.exit(1); }',
+    `console.log(${JSON.stringify(body)});`,
+  ].join("\n"));
+  const r = await runPiAgent({
+    cwd, role: "planner", task: "x", systemPrompt: "x",
+    model: "fake/model", modelTier: "super", tools: [],
+    piInvocation: { command: process.execPath, args: [fakeJs] },
+    maxRetries: 3, retryDelayMs: 10,
+  });
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.output, '{"ok":true}');
+});
+
+test("a goal is blocked when its cost budget is blown", async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "goal-budget-"));
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "goal-budget-bin-"));
+  const fakeJs = path.join(bin, "fake-budget.cjs");
+  const fakeBody = [
+    'const pathmod = require("node:path");',
+    'const a = process.argv.slice(2);',
+    'const i = a.indexOf("--append-system-prompt");',
+    'const base = pathmod.basename(i >= 0 ? a[i + 1] : "");',
+    'let text = "ok";',
+    'if (base.startsWith("planner")) text = JSON.stringify({summary:"p",acceptanceCriteria:[{id:"AC1",description:"x",required:true}],tasks:[{id:"T1",title:"t",description:"d",role:"coder",mode:"write",dependencies:[],acceptanceCriteria:["AC1"],filesHint:["x"],parallelSafe:false,risk:"low"}]});',
+    'else if (base.startsWith("plan-critic")) text = JSON.stringify({approved:true,issues:[]});',
+    'console.log(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text}],usage:{input:1,output:1,totalTokens:2},stopReason:"stop"}}));',
+  ].join("\n");
+  fs.writeFileSync(fakeJs, fakeBody);
+  process.env.PI_GOAL_GRAPH_FAKE_PI = fakeJs;
+  try {
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.execution.maxCostUsd = 0;          // spent-everything budget -> should block before any write
+    const p = pathsFor(cwd);
+    fs.mkdirSync(path.dirname(p.configFile), { recursive: true });
+    fs.writeFileSync(p.configFile, JSON.stringify(cfg, null, 2));
+    const orchestrator = new GoalOrchestrator(cwd);
+    const goal = await orchestrator.start("mock budget goal");
+    assert.equal(goal.status, "blocked");
+    assert.ok(/Cost budget/.test(goal.blockedReason ?? ""), `unexpected reason: ${goal.blockedReason}`);
+  } finally {
+    delete process.env.PI_GOAL_GRAPH_FAKE_PI;
+  }
+});
 
 test("orchestrator completes a full mocked plan-work-review-audit graph", async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "goal-e2e-"));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), "goal-e2e-bin-"));
-  const fake = path.join(bin, "pi");
-  fs.writeFileSync(fake, `#!/usr/bin/env node
-const args = process.argv.slice(2);
-const i = args.indexOf("--append-system-prompt");
-const prompt = i >= 0 ? args[i + 1] : "";
-const base = require("node:path").basename(prompt);
-let text = "ok";
-if (base.startsWith("planner")) text = JSON.stringify({summary:"mock plan",acceptanceCriteria:[{id:"AC1",description:"mock goal is verified",required:true}],tasks:[{id:"T1",title:"implement",description:"perform mock implementation",role:"coder",mode:"write",dependencies:[],acceptanceCriteria:["AC1"],filesHint:["mock.txt"],parallelSafe:false,risk:"low"}]});
-else if (base.startsWith("plan-critic")) text = JSON.stringify({approved:true,issues:[]});
-else if (base.startsWith("reviewer")) text = JSON.stringify({pass:true,summary:"review clean",findings:[]});
-else if (base.startsWith("auditor")) text = JSON.stringify({pass:true,summary:"all criteria verified",criteria:[{criterionId:"AC1",status:"verified",reason:"mock evidence",evidenceIds:[]}],missingWork:[]});
-else if (base.startsWith("reflection")) text = JSON.stringify({episodeSummary:"successful mocked run",lessons:[]});
-console.log(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text}],usage:{input:1,output:1,totalTokens:2},stopReason:"stop"}}));
-`);
-  fs.chmodSync(fake, 0o755);
-  const oldPath = process.env.PATH;
-  const oldArgv1 = process.argv[1];
-  process.env.PATH = `${bin}:${oldPath}`;
-  process.argv[1] = path.join(cwd, "does-not-exist.js");
+  const fakeJs = path.join(bin, "fake-pi-e2e.cjs");
+  const fakeBody = [
+    'const pathmod = require("node:path");',
+    'const a = process.argv.slice(2);',
+    'const i = a.indexOf("--append-system-prompt");',
+    'const base = pathmod.basename(i >= 0 ? a[i + 1] : "");',
+    'let text = "ok";',
+    'if (base.startsWith("planner")) text = JSON.stringify({summary:"mock plan",acceptanceCriteria:[{id:"AC1",description:"mock goal is verified",required:true}],tasks:[{id:"T1",title:"implement",description:"perform mock implementation",role:"coder",mode:"write",dependencies:[],acceptanceCriteria:["AC1"],filesHint:["mock.txt"],parallelSafe:false,risk:"low"}]});',
+    'else if (base.startsWith("plan-critic")) text = JSON.stringify({approved:true,issues:[]});',
+    'else if (base.startsWith("reviewer")) text = JSON.stringify({pass:true,summary:"review clean",findings:[]});',
+    'else if (base.startsWith("auditor")) text = JSON.stringify({pass:true,summary:"all criteria verified",criteria:[{criterionId:"AC1",status:"verified",reason:"mock evidence",evidenceIds:[]}],missingWork:[]});',
+    'else if (base.startsWith("reflection")) text = JSON.stringify({episodeSummary:"successful mocked run",lessons:[]});',
+    'console.log(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text}],usage:{input:1,output:1,totalTokens:2},stopReason:"stop"}}));',
+  ].join("\n");
+  fs.writeFileSync(fakeJs, fakeBody);
+  process.env.PI_GOAL_GRAPH_FAKE_PI = fakeJs;
   try {
     const orchestrator = new GoalOrchestrator(cwd);
     const goal = await orchestrator.start("mock goal");
@@ -182,7 +240,6 @@ console.log(JSON.stringify({type:"message_end",message:{role:"assistant",content
     assert.equal(goal.tasks[0].status, "completed");
     assert.equal(goal.acceptanceCriteria[0].status, "verified");
   } finally {
-    process.env.PATH = oldPath;
-    process.argv[1] = oldArgv1;
+    delete process.env.PI_GOAL_GRAPH_FAKE_PI;
   }
 });

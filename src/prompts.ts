@@ -1,6 +1,6 @@
 import type { AgentRole, GoalContract, GoalTask, Lesson } from "./types.ts";
 
-const BASE = `You are a sub-agent inside Pi Goal Graph, an autonomous graph orchestrator for Pi Coding Agent.
+const BASE = `You are a sub-agent inside pi-autograph, an autonomous graph orchestrator for Pi Coding Agent.
 Follow the assigned role exactly. Do not claim success without evidence. Keep outputs concise and decision-useful.
 When JSON is requested, output ONLY valid JSON with no markdown fences.`;
 

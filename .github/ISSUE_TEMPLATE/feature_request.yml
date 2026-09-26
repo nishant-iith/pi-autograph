@@ -1,0 +1,31 @@
+name: Feature / behavior change
+description: Propose a change to how pi-autograph drives goals
+title: "[feature] "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: We want real-measurement improvements - tell us the failure you saw in an actual run.
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The change
+      placeholder: What should pi-autograph do differently, and why?
+    validations: { required: true }
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence from a real run
+      description: What went wrong / what would this improve. Include .pi/goal-graph/ evidence if you can.
+    validations: { required: false }
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Guardrails respected
+      options:
+        - label: This does not auto-install any third-party tool
+          required: true
+        - label: This does not let a single model judgment become a global rule
+          required: true
+        - label: This stays framework-free (no LangGraph / vector DB) or justifies a dependency in docs/MASTER_SPEC.md
+          required: false
