@@ -1,0 +1,6 @@
+node_modules/
+.pi/goal-graph/
+dist/
+*.log
+__pycache__/
+.DS_Store

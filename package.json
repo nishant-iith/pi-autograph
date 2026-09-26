@@ -1,0 +1,37 @@
+{
+  "name": "pi-autograph",
+  "version": "0.4.0",
+  "description": "Autonomous multi-agent goal graph for Pi Coding Agent: plan -> critique -> parallel DAG -> deterministic check -> independent review -> completion audit. NVIDIA Nemotron routing, budget + retry circuit breakers, reversible context spills, and validated learning memory.",
+  "private": true,
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "multi-agent",
+    "agent-graph",
+    "autonomous-agent",
+    "nemotron",
+    "nvidia-nim"
+  ],
+  "author": "nishant-iith",
+  "contributors": [],
+  "license": "MIT",
+  "homepage": "https://github.com/nishant-iith/pi-autograph",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nishant-iith/pi-autograph.git"
+  },
+  "bugs": "https://github.com/nishant-iith/pi-autograph/issues",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "test": "node tests/run-tests.mjs",
+    "typecheck": "node tests/typecheck.mjs"
+  }
+}
