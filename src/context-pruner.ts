@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { GoalGraphConfig } from "./types.ts";
 
-const MARKER = "[PI_GOAL_GRAPH_SPILL:";
+const MARKER = "[PI_AUTOGRAPH_SPILL:";
 
 function messageText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -31,7 +31,7 @@ function preview(text: string, file: string, maxInline: number): string {
   const head = Math.max(900, Math.floor(maxInline * 0.64));
   const tail = Math.max(500, maxInline - head);
   const omitted = Math.max(0, text.length - head - tail);
-  return `${text.slice(0, head)}\n\n[PI_GOAL_GRAPH_SPILL:${file}]\n[${omitted.toLocaleString()} characters omitted from active context; full raw output is recoverable at the path above.]\n\n${text.slice(-tail)}`;
+  return `${text.slice(0, head)}\n\n[PI_AUTOGRAPH_SPILL:${file}]\n[${omitted.toLocaleString()} characters omitted from active context; full raw output is recoverable at the path above.]\n\n${text.slice(-tail)}`;
 }
 
 function thresholdFor(percent: number | null | undefined, config: GoalGraphConfig): { pruneAbove: number; inline: number } {

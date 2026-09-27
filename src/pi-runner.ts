@@ -7,7 +7,7 @@ import type { AgentRole, AgentRunResult, ModelTier } from "./types.ts";
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
   // 1) CI/test override: run a fake worker with plain `node` on any OS
   //    (removes the POSIX `#!/bin/sh` dependencies the suite used to have).
-  const fake = process.env.PI_GOAL_GRAPH_FAKE_PI;
+  const fake = process.env.PI_AUTOGRAPH_FAKE_PI || process.env.PI_GOAL_GRAPH_FAKE_PI;
   if (fake) return { command: process.execPath, args: [fake, ...args] };
   const currentScript = process.argv[1];
   const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
@@ -102,8 +102,8 @@ function spawnOnce(invocation: { command: string; args: string[] }, options: Run
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
-        PI_GOAL_GRAPH_CHILD: "1",
-        PI_GOAL_GRAPH_GOAL_ID: options.goalId ?? "",
+        PI_AUTOGRAPH_CHILD: "1",
+        PI_AUTOGRAPH_GOAL_ID: options.goalId ?? "",
       },
     });
 

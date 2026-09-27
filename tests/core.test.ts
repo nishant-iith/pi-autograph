@@ -128,7 +128,7 @@ test("context pruner reversibly spills oversized tool results", () => {
   assert.equal(out.messages[0], messages[0]);
   const replacement = out.messages[1].content[0].text as string;
   assert.ok(replacement.length < raw.length);
-  const match = replacement.match(/\[PI_GOAL_GRAPH_SPILL:([^\]]+)\]/);
+  const match = replacement.match(/\[PI_AUTOGRAPH_SPILL:([^\]]+)\]/);
   assert.ok(match, "missing reversible spill marker");
   const spillFile = path.resolve(cwd, match![1]);
   assert.equal(fs.readFileSync(spillFile, "utf8"), raw);
