@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.2 — 2026-09-28 — proper Laya + Grill Me + race/shutdown fixes
+
+### Fixes
+- **/goal-kill race closed**: `runInForeground` and `runInBackground` now only clear `activeRun`/`activeController` in `.finally()` if they still point at this run, so a slow-settling old goal can no longer wipe a newer one. `/goal-kill` uses the same check. A second start during cleanup can't be clobbered anymore.
+- **Completion recovery returns fresh checks**: `completionRecovery` now returns `{ review, checks }`, and the audit afterwards consumes them. The auditor now sees the state after repair, not before.
+- **executeDag no-progress no longer hard-blocks**: it now triggers `completionRecovery` and retries; only returns blocked when recovery itself fails.
+- **repairFailedChecks no longer unconditionally blocks**: it now returns the failing checks and lets the caller decide (recovery), instead of terminal-block after `maxRepairStrategies`.
+- **Laya integration is real now**: replaced the synthetic OpenAI-compatible stub with an actual call against the public Laya Gradio Space (`convaiinnovations/laya-demo`, `/run_router`) — typed decision flavor, not a chat LLM. Decisions are cached by a small LRU to keep the same signature fast. `laya-local` now aliases to the same real path (so existing configs keep working); `laya-hf` accepts a custom Space URL + optional private bearer token. `laya-placeholder` still exists as a pure-heuristic alias.
+- **Laya health fallback wired**: `makeDecisionEngine()` wraps laya-local/laya-hf in `LayaWithFallback`. If the space returns an error the first call, AutoGraph silently falls back to heuristics.
+- **Grill Me is now a real loop**: instead of three canned questions, it asks “What's still ambiguous?” repeatedly (up to 8), captures each answer into a running contract of `Resolved: ...` lines, then freezes the contract. Cancel exits safely.
+- **UI type fixes**: the extension now compiles against the real `@earendil-works/pi-coding-agent` extension API (real `registerCommand` and `ExtensionCommandContext` types instead of the hand-rolled stubs).
+
 ## 0.6.1 — 2026-09-28 — reliability & real integrations
 
 ### Fixes

@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { GoalGraphConfig, ToolRegistry } from "./types.ts";
 
 export const DEFAULT_CONFIG: GoalGraphConfig = {
-  version: "0.6.1",
+  version: "0.6.2",
   models: {
     default: "nvidia/nvidia/nemotron-3-super-120b-a12b",
     escalation: "nvidia/nvidia/nemotron-3-ultra-550b-a55b",
@@ -18,9 +18,11 @@ export const DEFAULT_CONFIG: GoalGraphConfig = {
   },
   decisionEngine: {
     provider: "heuristic",
-    layaLocalModel: "nvidia/nemotron-mini-4b-instruct",
-    layaHFEndpoint: "",
+    layaSpaceUrl: "https://convaiinnovations-laya-demo.hf.space",
+    layaRouterApi: "run_router",
     layaHFToken: "",
+    layaSmallModel: "nvidia/nemotron-3-super-120b-a12b",
+    layaLargeModel: "nvidia/nemotron-3-ultra-550b-a55b",
     confidenceEscalationThreshold: 0.75,
   },
   review: {

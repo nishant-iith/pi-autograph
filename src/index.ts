@@ -34,8 +34,9 @@ async function runInForeground(orchestrator: GoalOrchestrator, operation: (signa
     ui.notify("A goal run is already active. Use /goal-status or /goal-pause.", "warning");
     return;
   }
-  activeController = new AbortController();
-  const signal = activeController.signal;
+  const controller = new AbortController();
+  activeController = controller;
+  const signal = controller.signal;
   const run = operation(signal);
   activeRun = run;
   try {
@@ -44,8 +45,9 @@ async function runInForeground(orchestrator: GoalOrchestrator, operation: (signa
   } catch (err) {
     ui.notify(`Goal run error: ${err}`, "error");
   } finally {
-    activeRun = null;
-    activeController = null;
+    // Only clear globals if they're still ours (prevents a slow-settling old run from wiping a new one).
+    if (activeRun === run) activeRun = null;
+    if (activeController === controller) activeController = null;
   }
 }
 
@@ -54,16 +56,17 @@ function runInBackground(orchestrator: GoalOrchestrator, operation: (signal: Abo
     ui.notify("A goal run is already active. Use /goal-status or /goal-pause.", "warning");
     return;
   }
-  activeController = new AbortController();
-  const signal = activeController.signal;
+  const controller = new AbortController();
+  activeController = controller;
+  const signal = controller.signal;
   const run = operation(signal);
   activeRun = run;
   run
     .then((goal) => notifyGoalResult(ui, goal, true))
     .catch((err) => ui.notify(`Goal run error: ${err}`, "error"))
     .finally(() => {
-      activeRun = null;
-      activeController = null;
+      if (activeRun === run) activeRun = null;
+      if (activeController === controller) activeController = null;
     });
 }
 
@@ -110,17 +113,24 @@ export default function (pi: ExtensionAPI) {
       },
       grill: async (objective: string): Promise<string | null> => {
         if (!ctx.hasUI) return objective;
-        const DECISION_QUESTIONS = [
-          "Any non-negotiable constraints? (tech stack, deadline, scope)",
-          "What does 'done' look like, concretely?",
-          "Anything explicitly out of scope?",
-        ];
+        const start = await ctx.ui.confirm("Grill Me: resolve ambiguities before planning?", objective);
+        if (!start) return null;
+        // Iterative questioning
         let refined = objective;
-        for (const q of DECISION_QUESTIONS) {
-          const ans = await ctx.ui.input(q, "Enter constraint or skip with Enter");
-          if (ans === undefined) return null; // user cancelled
-          const trimmed = ans.trim();
-          if (trimmed) refined += `\nConstraint: ${trimmed}`;
+        let more = true;
+        let guard = 0;
+        while (more && guard < 8) {
+          guard++;
+          const question = await ctx.ui.input("What's still ambiguous?", "(or press Enter to stop)");
+          if (question === undefined) return null; // user cancelled
+          const q = question.trim();
+          if (!q) { more = false; break; }
+          const ans = await ctx.ui.input(q, "Your answer");
+          if (ans === undefined) return null;
+          const a = ans.trim();
+          if (a) refined += `\nResolved: ${q} → ${a}`;
+          const wantsMore = await ctx.ui.confirm("More questions?", `Current contract:\n${refined}`);
+          if (!wantsMore) more = false;
         }
         const ok = await ctx.ui.confirm("Freeze Goal Contract and start planning?", refined);
         if (!ok) return null;
@@ -260,8 +270,9 @@ export default function (pi: ExtensionAPI) {
         saveGoal(ctx.cwd, goal);
         appendEvent(ctx.cwd, goal.id, "killed_by_user", {});
       }
-      activeRun = null;
-      activeController = null;
+      // Only clear globals that still reference this kill's run/controller.
+      if (activeRun === run) activeRun = null;
+      if (activeController === controller) activeController = null;
       ctx.ui.notify("All goal workers killed.", "warning");
     },
   });
@@ -330,22 +341,18 @@ export default function (pi: ExtensionAPI) {
       if (ctx.hasUI) {
         const provider = await ctx.ui.select("Laya decision engine?", [
           "heuristic (instant, recommended default)",
-          "laya-local (OpenAI-compatible local endpoint, e.g. Ollama)",
-          "laya-hf (Hugging Face Inference Endpoint)",
+          "laya-local (public Space: convaiinnovations-laya-demo)",
+          "laya-hf (self-hosted/duplicate Gradio Space)",
           "laya-placeholder (legacy alias for heuristic)",
         ]);
         if (provider) {
           if (provider.startsWith("laya-local")) {
             config.decisionEngine.provider = "laya-local";
-            const endpoint = await ctx.ui.input("Local endpoint URL", "http://localhost:11434/v1/chat/completions");
-            if (endpoint !== undefined) config.decisionEngine.layaHFEndpoint = endpoint; // reused as generic endpoint URL
-            const model = await ctx.ui.input("Local model name", "nvidia/nemotron-mini-4b-instruct");
-            if (model !== undefined && model.trim()) config.decisionEngine.layaLocalModel = model.trim();
           } else if (provider.startsWith("laya-hf")) {
             config.decisionEngine.provider = "laya-hf";
-            const endpoint = await ctx.ui.input("HF Inference Endpoint URL", "https://...");
-            if (endpoint !== undefined) config.decisionEngine.layaHFEndpoint = endpoint;
-            const token = await ctx.ui.input("HF API token (optional)", "hf_...");
+            const space = await ctx.ui.input("Laya Space URL", "https://convaiinnovations-laya-demo.hf.space");
+            if (space !== undefined) config.decisionEngine.layaSpaceUrl = space;
+            const token = await ctx.ui.input("HF token (optional, for private Spaces)", "");
             if (token !== undefined) config.decisionEngine.layaHFToken = token;
           } else if (provider.startsWith("laya-placeholder")) {
             config.decisionEngine.provider = "laya-placeholder";
@@ -369,7 +376,6 @@ export default function (pi: ExtensionAPI) {
       }
       ctx.ui.notify(lines.join("\n"), "info");
 
-      // Persist once per project
       saveConfig(p.configFile, config);
       saveTools(p.toolsFile, tools);
       ctx.ui.notify("Configuration saved.", "info");

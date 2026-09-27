@@ -197,12 +197,16 @@ export interface GoalGraphConfig {
   };
   decisionEngine: {
     provider: "heuristic" | "laya-placeholder" | "laya-local" | "laya-hf";
-    /** Local Laya model name (for laya-local provider). */
-    layaLocalModel?: string;
-    /** Hugging Face Inference Endpoint URL (for laya-hf provider). */
-    layaHFEndpoint?: string;
-    /** HF API token (for laya-hf provider). */
+    /** Laya Gradio Space URL (e.g. https://convaiinnovations-laya-demo.hf.space). */
+    layaSpaceUrl?: string;
+    /** Laya router endpoint name (defaults to "/run_router"). */
+    layaRouterApi?: string;
+    /** Laya HF token (used as Bearer for private Spaces). */
     layaHFToken?: string;
+    /** Cheap model name used in router decision handler. */
+    layaSmallModel?: string;
+    /** Strong model name used in router decision handler. */
+    layaLargeModel?: string;
     confidenceEscalationThreshold: number;
   };
   review: {

@@ -20,37 +20,7 @@ export interface DecisionEngine {
   healthCheck(): Promise<boolean>;
 }
 
-function buildChooseModelPrompt(input: {
-  task: GoalTask;
-  repeatedFailureCount: number;
-  disputedReview?: boolean;
-  auditAmbiguous?: boolean;
-}): string {
-  const { task, repeatedFailureCount, disputedReview, auditAmbiguous } = input;
-  return `Task routing decision.
-Role: ${task.role}
-Mode: ${task.mode}
-Risk: ${task.risk}
-ParallelSafe: ${task.parallelSafe}
-Repeated failures: ${repeatedFailureCount}
-Disputed review: ${disputedReview ? "yes" : "no"}
-Ambiguous audit: ${auditAmbiguous ? "yes" : "no"}
-
-Choose tier: "super" (fast, cheap) or "ultra" (slow, thorough).
-Output ONLY JSON: {"tier":"super|ultra","reason":"...","confidence":0.0-1.0}`;
-}
-
-function buildClassifyFailurePrompt(input: { output: string; task?: GoalTask }): string {
-  const { output, task } = input;
-  return `Failure classification.
-Task role: ${task?.role ?? "unknown"}
-Failure output (truncated):
-${output.slice(0, 2000)}
-
-Classify route: "blocked" | "architecture" | "debugger" | "planner"
-Output ONLY JSON: {"route":"...","reason":"...","confidence":0.0-1.0}`;
-}
-
+/** Heuristic fallback engine (always available, fast, no network). */
 export class HeuristicDecisionEngine implements DecisionEngine {
   name = "heuristic";
 
@@ -93,147 +63,91 @@ export class HeuristicDecisionEngine implements DecisionEngine {
   async healthCheck(): Promise<boolean> { return true; }
 }
 
+/** Build the router "request" payload that Laya's /run_router expects. */
+function buildRouterRequest(input: {
+  task: GoalTask;
+  repeatedFailureCount: number;
+  disputedReview?: boolean;
+  auditAmbiguous?: boolean;
+}): { request: string; small: string; large: string } {
+  const { task, repeatedFailureCount, disputedReview, auditAmbiguous } = input;
+  const reasons: string[] = [];
+  if (task.role === "architecture") reasons.push("Architecture task");
+  if (task.risk === "high") reasons.push("High risk");
+  if (repeatedFailureCount >= 2) reasons.push(`${repeatedFailureCount} repeated failures`);
+  if (disputedReview) reasons.push("Disputed blocking review");
+  if (auditAmbiguous) reasons.push("Ambiguous completion audit");
+  reasons.push(`${task.mode} scope: ${task.filesHint.join(", ") || "unknown"}`);
+  return {
+    request: `Route subtask "${task.id}" (${task.role}, ${task.mode} mode). ${reasons.join(". ")}`,
+    small: "",
+    large: "",
+  };
+}
+
 /**
- * Laya Local - calls an OpenAI-compatible local endpoint (Ollama / llama.cpp / NIM / vLLM).
- * Hits the endpoint directly via fetch; no Pi process per call, so per-decision cost is <100ms once warm.
+ * Call the Laya Gradio Space with a typed request. Laya returns Dataframe rows;
+ * we treat the first row's "route"/"answer"/"decision" as the Laya answer.
  */
-export class LayaLocalDecisionEngine implements DecisionEngine {
-  name = "laya-local";
-  private readonly fallback = new HeuristicDecisionEngine();
-  private readonly cache = new Map<string, RouterDecision | FailureDecision>();
-  private healthy: boolean | null = null;
-
-  constructor(private readonly config: GoalGraphConfig, private readonly cwd: string, private readonly maxCacheSize = 512) {}
-
-  private endpoint(): string | null {
-    const ep = this.config.decisionEngine.layaHFEndpoint?.trim();
-    if (!ep) return null;
-    return ep.endsWith("/chat/completions") ? ep : `${ep.replace(/\/$/, "")}/v1/chat/completions`;
-  }
-
-  private model(): string {
-    return this.config.decisionEngine.layaLocalModel || "nemotron-mini-4b-instruct";
-  }
-
-  private async runLaya(prompt: string, cacheKey: string): Promise<RouterDecision | FailureDecision | null> {
-    if (this.healthy === false) return this.fallback.chooseModel({ task: { id: "", title: "", description: "", role: "coder", mode: "read", dependencies: [], acceptanceCriteria: [], filesHint: [], parallelSafe: false, risk: "low", status: "pending", attempts: 0, modelHistory: [] }, repeatedFailureCount: 0 });
-    const cached = this.cache.get(cacheKey);
-    if (cached) return cached;
-    const url = this.endpoint();
-    if (!url) return this.fallback.chooseModel({ task: { id: "", title: "", description: "", role: "coder", mode: "read", dependencies: [], acceptanceCriteria: [], filesHint: [], parallelSafe: false, risk: "low", status: "pending", attempts: 0, modelHistory: [] }, repeatedFailureCount: 0 });
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8000);
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: this.model(), messages: [{ role: "user", content: prompt }], max_tokens: 256, temperature: 0 }),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) { this.healthy = false; return null; }
-      const data: unknown = await res.json();
-      const first = (data as { choices?: Array<{ message?: { content?: string } }> })?.choices?.[0]?.message?.content ?? "";
-      const parsed = JSON.parse(first.trim());
-      this.cacheDecision(cacheKey, parsed);
-      return parsed;
-    } catch {
-      this.healthy = false;
-      return null;
+async function callLayaSpace(
+  spaceUrl: string,
+  api: string,
+  inputs: Record<string, unknown>,
+  token?: string,
+  timeoutMs = 15000,
+): Promise<unknown> {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const url = `${spaceUrl.replace(/\/$/, "")}/gradio_api/call/${api.replace(/^\//, "")}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ data: Object.values(inputs) }),
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = (await res.json()) as { event_id?: string };
+    if (!body.event_id) throw new Error("no event_id");
+    // Gradio v4 returns an SSE event stream; we read until we get a data: line.
+    const pollUrl = `${url}/${body.event_id}`;
+    const poll = await fetch(pollUrl, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      signal: controller.signal,
+    });
+    if (!poll.ok) throw new Error(`HTTP ${poll.status}`);
+    const text = await poll.text();
+    let out: unknown = null;
+    for (const line of text.split(/\r?\n/)) {
+      if (line.startsWith("data: ")) {
+        try { out = JSON.parse(line.slice(6)); break; } catch { /* keep scanning */ }
+      }
     }
-  }
-
-  private cacheDecision(key: string, value: RouterDecision | FailureDecision): void {
-    if (this.cache.size >= this.maxCacheSize) {
-      const first = this.cache.keys().next().value;
-      if (first !== undefined) this.cache.delete(first);
-    }
-    this.cache.set(key, value);
-  }
-
-  private keyForChoose(input: { task: GoalTask; repeatedFailureCount: number; disputedReview?: boolean; auditAmbiguous?: boolean }): string {
-    return `choose:${input.task.role}:${input.task.mode}:${input.task.risk}:${input.repeatedFailureCount}:${!!input.disputedReview}:${!!input.auditAmbiguous}`;
-  }
-
-  private keyForFailure(input: { output: string; task?: GoalTask }): string {
-    const sig = failureSignature(input.output);
-    return `fail:${sig}:${input.task?.role ?? "?"}`;
-  }
-
-  async chooseModel(input: { task: GoalTask; repeatedFailureCount: number; disputedReview?: boolean; auditAmbiguous?: boolean; }): Promise<RouterDecision | null> {
-    const key = this.keyForChoose(input);
-    const prompt = buildChooseModelPrompt(input);
-    const out = await this.runLaya(prompt, key);
-    return (out && "tier" in out ? out : null) as RouterDecision | null;
-  }
-
-  async classifyFailure(input: { output: string; task?: GoalTask }): Promise<FailureDecision | null> {
-    const key = this.keyForFailure(input);
-    const prompt = buildClassifyFailurePrompt(input);
-    const out = await this.runLaya(prompt, key);
-    return (out && "route" in out ? out : null) as FailureDecision | null;
-  }
-
-  async healthCheck(): Promise<boolean> {
-    if (this.healthy !== null) return this.healthy;
-    const url = this.endpoint();
-    if (!url) { this.healthy = false; return false; }
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3000);
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: this.model(), messages: [{ role: "user", content: "ping" }], max_tokens: 4 }),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      this.healthy = res.ok;
-      return this.healthy;
-    } catch {
-      this.healthy = false;
-      return false;
-    }
+    return out;
+  } finally {
+    clearTimeout(t);
   }
 }
 
 /**
- * Laya Hugging Face - calls HF Inference Endpoint.
+ * Laya via Gradio Space — the real typed-decision model.
+ * Defaults to the public https://convaiinnovations-laya-demo.hf.space which exposes /run_router.
  */
-export class LayaHFDecisionEngine implements DecisionEngine {
-  name = "laya-hf";
-  constructor(private readonly config: GoalGraphConfig) {}
+export class LayaSpaceDecisionEngine implements DecisionEngine {
+  name = "laya-space";
+  private readonly cache = new Map<string, RouterDecision | FailureDecision>();
 
-  private async callHF(prompt: string): Promise<RouterDecision | FailureDecision | null> {
-    const endpoint = this.config.decisionEngine.layaHFEndpoint;
-    const token = this.config.decisionEngine.layaHFToken;
-    if (!endpoint) return null;
+  constructor(private readonly config: GoalGraphConfig, private readonly cwd: string) {}
 
-    try {
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({
-          inputs: prompt,
-          parameters: { max_new_tokens: 100, temperature: 0.1, return_full_text: false },
-        }),
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!res.ok) return null;
-      const data: unknown = await res.json();
-      let text = "";
-      if (Array.isArray(data)) {
-        text = (data[0] as { generated_text?: string })?.generated_text ?? "";
-      } else if (data && typeof data === "object") {
-        text = (data as { generated_text?: string }).generated_text ?? "";
-      }
-      return JSON.parse(text.trim());
-    } catch {
-      return null;
-    }
+  private spaceUrl(): string {
+    return (this.config.decisionEngine.layaSpaceUrl || "https://convaiinnovations-laya-demo.hf.space").replace(/\/$/, "");
+  }
+
+  private routerApi(): string {
+    return this.config.decisionEngine.layaRouterApi || "run_router";
   }
 
   async chooseModel(input: {
@@ -242,34 +156,134 @@ export class LayaHFDecisionEngine implements DecisionEngine {
     disputedReview?: boolean;
     auditAmbiguous?: boolean;
   }): Promise<RouterDecision | null> {
-    const prompt = buildChooseModelPrompt(input);
-    return this.callHF(prompt) as Promise<RouterDecision | null>;
+    const key = `choose:${input.task.role}:${input.task.mode}:${input.task.risk}:${input.repeatedFailureCount}:${!!input.disputedReview}:${!!input.auditAmbiguous}`;
+    const cached = this.cache.get(key);
+    if (cached && "tier" in cached) return cached as RouterDecision;
+    const req = buildRouterRequest(input);
+    const small = this.config.decisionEngine.layaSmallModel ?? this.config.models.default;
+    const large = this.config.decisionEngine.layaLargeModel ?? this.config.models.escalation;
+    try {
+      const result = await callLayaSpace(
+        this.spaceUrl(),
+        this.routerApi(),
+        { request: req.request, small, large },
+        this.config.decisionEngine.layaHFToken,
+        15000,
+      );
+      if (!result) return null;
+      const decision = this.parseRouterResponse(result, small, large, input);
+      if (decision) this.cacheSet(key, decision);
+      return decision;
+    } catch {
+      return null;
+    }
   }
 
   async classifyFailure(input: { output: string; task?: GoalTask }): Promise<FailureDecision | null> {
-    const prompt = buildClassifyFailurePrompt(input);
-    return this.callHF(prompt) as Promise<FailureDecision | null>;
+    // Use the router endpoint to classify the failure: we treat the state string
+    // as the task that Laya must route; mount the failure output as the request.
+    const key = `classify:${failureSignature(input.output)}:${input.task?.role ?? "?"}`;
+    const cached = this.cache.get(key);
+    if (cached && "route" in cached) return cached as FailureDecision;
+    try {
+      const result = await callLayaSpace(
+        this.spaceUrl(),
+        this.routerApi(),
+        {
+          request: `Classify this failure output: route to planner/architecture/debugger/blocked. Output: ${input.output.slice(0, 1200)}`,
+          small: this.config.decisionEngine.layaSmallModel ?? this.config.models.default,
+          large: this.config.decisionEngine.layaLargeModel ?? this.config.models.escalation,
+        },
+        this.config.decisionEngine.layaHFToken,
+        15000,
+      );
+      if (!result) return null;
+      const decision = this.parseFailureResponse(result);
+      if (decision) this.cacheSet(key, decision);
+      return decision;
+    } catch {
+      return null;
+    }
   }
 
   async healthCheck(): Promise<boolean> {
     try {
-      const endpoint = this.config.decisionEngine.layaHFEndpoint;
-      if (!endpoint) return false;
-      const token = this.config.decisionEngine.layaHFToken;
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ inputs: "health check", parameters: { max_new_tokens: 10 } }),
-        signal: AbortSignal.timeout(5000),
-      });
-      return res.ok;
+      const result = await callLayaSpace(
+        this.spaceUrl(),
+        this.routerApi(),
+        { request: "health check", small: this.config.decisionEngine.layaSmallModel ?? this.config.models.default, large: this.config.decisionEngine.layaLargeModel ?? this.config.models.escalation },
+        this.config.decisionEngine.layaHFToken,
+        8000,
+      );
+      return result !== null;
     } catch {
       return false;
     }
   }
+
+  private cacheSet(key: string, value: RouterDecision | FailureDecision): void {
+    if (this.cache.size > 512) {
+      const first = this.cache.keys().next().value;
+      if (first !== undefined) this.cache.delete(first);
+    }
+    this.cache.set(key, value);
+  }
+
+  private parseRouterResponse(data: unknown, small: string, large: string, input: { task: GoalTask; repeatedFailureCount: number; disputedReview?: boolean; auditAmbiguous?: boolean }): RouterDecision | null {
+    // Laya /run_router returns Gradio Dataframe rows: [request, chosen_model, reasoning]
+    let rows: unknown[][] | null = null;
+    if (Array.isArray(data) && Array.isArray(data[0])) {
+      rows = data as unknown[][];
+    } else if (data && typeof data === "object" && "data" in data) {
+      const d = (data as { data?: { data?: unknown[][] } }).data?.data;
+      if (Array.isArray(d) && Array.isArray(d[0])) rows = d as unknown[][];
+    }
+    if (!rows || rows.length === 0) return null;
+    const first = rows.find((r) => Array.isArray(r) && r.length > 0);
+    if (!first) return null;
+    const text = JSON.stringify(first).toLowerCase();
+    const escalation = ["ultra", large.toLowerCase()];
+    const cheap = ["super", small.toLowerCase()];
+    let tier: ModelTier = "super";
+    if (escalation.some((m) => text.includes(m))) tier = "ultra";
+    else if (cheap.some((m) => text.includes(m))) tier = "super";
+    else return null;
+    const confidence = input.task.risk === "high" ? 0.7 : 0.65;
+    const reason = `Laya routed → ${tier}`;
+    return { tier, reason, confidence };
+  }
+
+  private parseFailureResponse(data: unknown): FailureDecision | null {
+    let rows: unknown[][] | null = null;
+    if (Array.isArray(data) && Array.isArray(data[0])) {
+      rows = data as unknown[][];
+    } else if (data && typeof data === "object" && "data" in data) {
+      const d = (data as { data?: { data?: unknown[][] } }).data?.data;
+      if (Array.isArray(d) && Array.isArray(d[0])) rows = d as unknown[][];
+    }
+    if (!rows || rows.length === 0) return null;
+    const first = rows.find((r) => Array.isArray(r) && r.length > 0);
+    if (!first) return null;
+    const text = JSON.stringify(first).toLowerCase();
+    if (text.includes("blocked")) return { route: "blocked", reason: "Laya classified as blocked", confidence: 0.7 };
+    if (text.includes("architecture")) return { route: "architecture", reason: "Laya classified as architecture", confidence: 0.65 };
+    if (text.includes("planner")) return { route: "planner", reason: "Laya classified as planner", confidence: 0.65 };
+    if (text.includes("debugger") || text.includes("debug")) return { route: "debugger", reason: "Laya classified as debugger", confidence: 0.75 };
+    return null;
+  }
+}
+
+/**
+ * Laya HF placeholder (kept for backward compat). If you previously set `laya-hf`,
+ * we now route to the real Laya Gradio Space under `layaSpaceUrl` instead.
+ */
+export class LayaHFDecisionEngine extends LayaSpaceDecisionEngine {
+  constructor(config: GoalGraphConfig) { super(config, ""); }
+}
+
+/** Alias so the old `laya-local` provider works — it now points at the same Gradio Space flow. */
+export class LayaLocalDecisionEngine extends LayaSpaceDecisionEngine {
+  constructor(config: GoalGraphConfig, cwd: string) { super(config, cwd); }
 }
 
 /**
@@ -288,10 +302,8 @@ export function makeDecisionEngine(config: GoalGraphConfig, cwd: string): Decisi
   let engine: DecisionEngine;
   switch (de.provider) {
     case "laya-local":
-      engine = new LayaLocalDecisionEngine(config, cwd);
-      break;
     case "laya-hf":
-      engine = new LayaHFDecisionEngine(config);
+      engine = new LayaLocalDecisionEngine(config, cwd);
       break;
     case "laya-placeholder":
       engine = new LayaPlaceholderDecisionEngine();
@@ -301,7 +313,6 @@ export function makeDecisionEngine(config: GoalGraphConfig, cwd: string): Decisi
       engine = new HeuristicDecisionEngine();
       break;
   }
-  // Fallback chain: if the chosen Laya provider isn't healthy, fall through to heuristic.
   if (de.provider === "laya-local" || de.provider === "laya-hf") {
     return new LayaWithFallback(engine);
   }
@@ -333,8 +344,7 @@ export async function routeModel(
 ): Promise<{ tier: ModelTier; model: string; reason: string; confidence: number }> {
   const decision = await engine.chooseModel({ task, repeatedFailureCount, ...extra });
   const tier = decision?.tier ?? "super";
-  
-  // Use confidenceEscalationThreshold: if confidence is LOW, escalate to Ultra for safety
+  // Low-confidence escalation: if Laya returns a non-confident Super, escalate to Ultra.
   const threshold = config.decisionEngine.confidenceEscalationThreshold;
   if (tier === "super" && decision && decision.confidence < threshold) {
     return {
@@ -344,7 +354,6 @@ export async function routeModel(
       confidence: decision.confidence,
     };
   }
-  
   return {
     tier,
     model: tier === "ultra" ? config.models.escalation : config.models.default,
