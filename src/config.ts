@@ -42,6 +42,7 @@ export const DEFAULT_CONFIG: GoalGraphConfig = {
     auditRepairCycles: 3,
     retryWorkerOnTransient: 3,
     maxCostUsd: null,
+    runInBackground: false,
   },
 };
 

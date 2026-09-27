@@ -20,6 +20,28 @@ function fmtGraph(goal: ReturnType<GoalOrchestrator["getActiveGoal"]>): string {
   return lines.join("\n");
 }
 
+async function runInForeground(orchestrator: GoalOrchestrator, operation: (signal: AbortSignal) => Promise<any>, ui: any): Promise<void> {
+  if (activeRun) {
+    ui.notify("A goal run is already active. Use /goal-status or /goal-pause.", "warning");
+    return;
+  }
+  activeController = new AbortController();
+  const signal = activeController.signal;
+  activeRun = operation(signal)
+    .then((goal) => {
+      if (goal?.status === "completed") ui.notify("Goal verified complete.", "success");
+      else if (goal?.status === "blocked") ui.notify(`Goal blocked: ${goal.blockedReason ?? "see /goal-status"}`, "warning");
+      else if (goal?.status === "failed") ui.notify(`Goal failed: ${goal.blockedReason ?? "see /goal-status"}`, "error");
+    })
+    .catch((error) => ui.notify(`Goal run error: ${error instanceof Error ? error.message : String(error)}`, "error"))
+    .finally(() => {
+      activeRun = null;
+      activeController = null;
+      ui.setStatus?.("goal-graph", undefined);
+    });
+  await activeRun;
+}
+
 function runInBackground(orchestrator: GoalOrchestrator, operation: (signal: AbortSignal) => Promise<any>, ui: any): void {
   if (activeRun) {
     ui.notify("A goal run is already active. Use /goal-status or /goal-pause.", "warning");
@@ -39,6 +61,23 @@ function runInBackground(orchestrator: GoalOrchestrator, operation: (signal: Abo
       activeController = null;
       ui.setStatus?.("goal-graph", undefined);
     });
+}
+
+async function promptRunMode(ui: any, defaultToForeground: boolean = true): Promise<"foreground" | "background"> {
+  if (!ui.hasUI) return defaultToForeground ? "foreground" : "background";
+  const choice = await ctx.ui.select("Run mode?", [
+    { name: "Foreground (see live progress)", value: "foreground" },
+    { name: "Background (run in background)", value: "background" },
+  ]);
+  return choice || (defaultToForeground ? "foreground" : "background");
+}
+
+async function runWithMode(orchestrator: GoalOrchestrator, operation: (signal: AbortSignal) => Promise<any>, ui: any, mode: "foreground" | "background"): Promise<void> {
+  if (mode === "foreground") {
+    await runInForeground(orchestrator, operation, ui);
+  } else {
+    runInBackground(orchestrator, operation, ui);
+  }
 }
 
 export default function (pi: ExtensionAPI) {
@@ -81,8 +120,10 @@ export default function (pi: ExtensionAPI) {
       const objective = args.trim();
       if (!objective) { ctx.ui.notify("Usage: /goal-direct <objective>", "warning"); return; }
       const o = make(ctx.cwd, ctx.ui);
-      runInBackground(o, (signal) => o.start(objective, signal), ctx.ui);
-      ctx.ui.notify("Goal Graph started in the background. Use /goal-status to inspect it.", "info");
+      const mode = await promptRunMode(ctx.ui, true);
+      await runWithMode(o, (signal) => o.start(objective, signal), ctx.ui, mode);
+      const msg = mode === "foreground" ? "Goal Graph started in foreground. Use /goal-status to inspect progress." : "Goal Graph started in the background. Use /goal-status to inspect it.";
+      ctx.ui.notify(msg, "info");
     },
   });
 
@@ -94,8 +135,10 @@ export default function (pi: ExtensionAPI) {
       const ok = ctx.hasUI ? await ctx.ui.confirm("Start Goal Graph?", objective) : true;
       if (!ok) return;
       const o = make(ctx.cwd, ctx.ui);
-      runInBackground(o, (signal) => o.start(objective, signal), ctx.ui);
-      ctx.ui.notify("Goal Graph started. Use /goal-status to inspect progress.", "info");
+      const mode = await promptRunMode(ctx.ui, true);
+      await runWithMode(o, (signal) => o.start(objective, signal), ctx.ui, mode);
+      const msg = mode === "foreground" ? "Goal Graph started in foreground. Use /goal-status to inspect progress." : "Goal Graph started in the background. Use /goal-status to inspect it.";
+      ctx.ui.notify(msg, "info");
     },
   });
 
@@ -134,7 +177,8 @@ export default function (pi: ExtensionAPI) {
       const goal = o.getActiveGoal();
       if (!goal) { ctx.ui.notify("No persisted goal to resume.", "warning"); return; }
       if (goal.status === "completed") { ctx.ui.notify("The active goal is already completed.", "info"); return; }
-      runInBackground(o, (signal) => o.resume(signal), ctx.ui);
+      const mode = await promptRunMode(ctx.ui, true);
+      await runWithMode(o, (signal) => o.resume(signal), ctx.ui, mode);
       ctx.ui.notify(`Resuming ${goal.id}.`, "info");
     },
   });
