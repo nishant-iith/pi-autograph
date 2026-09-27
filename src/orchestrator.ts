@@ -24,6 +24,7 @@ import {
   projectId,
   saveGoal,
 } from "./store.ts";
+import { loadRules, saveRules } from "./store.ts";
 import { extractJson, normalizeStringArray, shortText } from "./structured.ts";
 import { runPiAgent } from "./pi-runner.ts";
 import {
@@ -319,6 +320,7 @@ export class GoalOrchestrator {
     appendEvent(this.cwd, goal.id, "task_started", { taskId: task.id, role: task.role, modelTier: route.tier, reason: route.reason });
 
     const rules = relevantRules(this.cwd, `${goal.immutableObjective}\n${task.title}\n${task.description}`);
+    const ruleIds = rules.map(r => r.id);
     const deps = dependencySummaries(task, goal.tasks);
     const role: AgentRole = task.role;
     const agentTools = task.mode === "read" ? readOnlyTools() : writeTools();
@@ -329,6 +331,8 @@ export class GoalOrchestrator {
 
     if (result.exitCode === 0 && result.stopReason !== "error") {
       task.status = "completed";
+      // Track successful rule usage
+      if (ruleIds.length) this.trackRuleUsage(this.cwd, ruleIds, true);
       addEvidence(this.cwd, goal.id, {
         type: "agent",
         summary: `${task.id} completed by ${task.role} (${route.tier}): ${task.lastOutputSummary}`,
@@ -344,6 +348,8 @@ export class GoalOrchestrator {
     const equivalent = task.lastFailureSignature === signature ? task.attempts : 1;
     task.lastFailureSignature = signature;
     task.status = "failed";
+    // Track failed rule usage
+    if (ruleIds.length) this.trackRuleUsage(this.cwd, ruleIds, false);
     addEvidence(this.cwd, goal.id, {
       type: "agent",
       summary: `${task.id} failed (${signature}): ${shortText(raw || "unknown failure", 1800)}`,
@@ -575,6 +581,27 @@ export class GoalOrchestrator {
       tier = "ultra";
     }
     return { pass: false, summary: "Audit loop exhausted", criteria: [], missingWork: [] };
+  }
+
+  private trackRuleUsage(cwd: string, ruleIds: string[], success: boolean): void {
+    const p = pathsFor(cwd);
+    const projectRules = loadRules(p.projectRulesFile);
+    const globalRules = loadRules(p.globalRulesFile);
+    const ruleIdsSet = new Set(ruleIds);
+    for (const rule of [...projectRules, ...globalRules]) {
+      if (ruleIdsSet.has(rule.id)) {
+        if (success) {
+          rule.successfulUses += 1;
+          rule.confidence = Math.min(0.99, rule.confidence + 0.02);
+        } else {
+          rule.failedUses += 1;
+          rule.confidence = Math.max(0, rule.confidence - 0.05);
+        }
+        rule.lastUsed = now();
+      }
+    }
+    saveRules(p.projectRulesFile, projectRules);
+    saveRules(p.globalRulesFile, globalRules);
   }
 
   private async learn(goal: GoalContract, outcome: "success" | "blocked" | "failed", summary: string, signal?: AbortSignal): Promise<void> {
