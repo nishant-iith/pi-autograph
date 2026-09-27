@@ -321,6 +321,50 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("goal-init", {
+    description: "First-run setup: check models, tools, Laya, and save configuration",
+    handler: async (_args, ctx) => {
+      const p = pathsFor(ctx.cwd);
+      let config = loadConfig(p.configFile);
+      let tools = loadTools(p.toolsFile);
+      const lines: string[] = ["=== Goal Graph Setup ==="];
+      
+      // Check models
+      lines.push("", "Models:", `  Default: ${config.models.default}`, `  Escalation: ${config.models.escalation}`);
+      
+      // Check Laya
+      lines.push("", "Laya Decision Engine:", `  Provider: ${config.decisionEngine.provider}`);
+      if (config.decisionEngine.provider === "laya-local") {
+        lines.push(`  Local model: ${config.decisionEngine.layaLocalModel}`);
+        const nvidiaExists = await executableExists("nvidia", ctx.cwd).catch(() => false);
+        lines.push(`  Local available: ${nvidiaExists ? "yes (NIM)" : "check ollama/llama.cpp"}`);
+      } else if (config.decisionEngine.provider === "laya-hf") {
+        lines.push(`  HF Endpoint: ${config.decisionEngine.layaHFEndpoint || "not set"}`);
+      }
+      lines.push(`  Confidence escalation: < ${config.decisionEngine.confidenceEscalationThreshold}`);
+      
+      // Check tools
+      lines.push("", "External Review Tools:");
+      for (const [name, tool] of Object.entries(tools)) {
+        const installed = await executableExists(tool.executable, ctx.cwd).catch(() => false);
+        lines.push(`  ${name}: ${tool.status} | ${installed ? "installed" : "not found"}`);
+      }
+      
+      // Config details
+      lines.push("", "Current config:", JSON.stringify(config, null, 2).slice(0, 2000));
+      
+      ctx.ui.notify(lines.join("\n"), "info");
+      if (ctx.hasUI) {
+        const save = await ctx.ui.confirm("Apply default configuration?", "Save config for this project?");
+        if (save) {
+          saveConfig(p.configFile, config);
+          saveTools(p.toolsFile, tools);
+          ctx.ui.notify("Configuration saved.", "success");
+        }
+      }
+    },
+  });
+
   pi.registerCommand("goal-memory", {
     description: "Inspect learned project/candidate/global rules",
     handler: async (_args, ctx) => {
