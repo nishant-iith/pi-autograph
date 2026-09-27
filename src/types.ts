@@ -196,7 +196,13 @@ export interface GoalGraphConfig {
     maxHotEvidenceChars: number;
   };
   decisionEngine: {
-    provider: "heuristic" | "laya-placeholder";
+    provider: "heuristic" | "laya-placeholder" | "laya-local" | "laya-hf";
+    /** Local Laya model name (for laya-local provider). */
+    layaLocalModel?: string;
+    /** Hugging Face Inference Endpoint URL (for laya-hf provider). */
+    layaHFEndpoint?: string;
+    /** HF API token (for laya-hf provider). */
+    layaHFToken?: string;
     confidenceEscalationThreshold: number;
   };
   review: {
@@ -223,6 +229,8 @@ export interface GoalGraphConfig {
     retryWorkerOnTransient: number;
     /** Hard spend ceiling for a single goal; null = no budget guard. */
     maxCostUsd: number | null;
+    /** Run goals in background by default (foreground is default for /goal). */
+    runInBackground: boolean;
   };
 }
 

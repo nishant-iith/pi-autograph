@@ -54,6 +54,8 @@ export interface OrchestratorHooks {
   notify?: (message: string, level?: "info" | "success" | "warning" | "error") => void;
   status?: (message: string | null) => void;
   log?: (message: string) => void;
+  /** Grill Me preflight: ask clarifying questions. Return updated objective or null to cancel. */
+  grill?: (objective: string) => Promise<string | null>;
 }
 
 type PlanPayload = {
@@ -135,14 +137,14 @@ export class GoalOrchestrator {
     this.tools = loadTools(base.toolsFile);
     if (!fs.existsSync(base.configFile)) saveConfig(base.configFile, this.config);
     if (!fs.existsSync(base.toolsFile)) saveTools(base.toolsFile, this.tools);
-    this.engine = makeDecisionEngine(this.config);
+    this.engine = makeDecisionEngine(this.config, this.cwd);
   }
 
   reloadConfig(): void {
     const p = pathsFor(this.cwd);
     this.config = loadConfig(p.configFile);
     this.tools = loadTools(p.toolsFile);
-    this.engine = makeDecisionEngine(this.config);
+    this.engine = makeDecisionEngine(this.config, this.cwd);
   }
 
   getConfig(): GoalGraphConfig { return this.config; }
@@ -193,7 +195,27 @@ export class GoalOrchestrator {
     return result;
   }
 
+  private async grillMePreflight(objective: string, signal?: AbortSignal): Promise<string | null> {
+    if (this.hooks.grill) {
+      this.notify("Grill Me preflight: resolving ambiguities...");
+      const result = await this.hooks.grill(objective);
+      if (result === null) {
+        this.notify("Grill Me cancelled by user.", "warning");
+        return null;
+      }
+      if (result !== objective) {
+        this.notify("Objective refined via Grill Me.", "info");
+      }
+      return result;
+    }
+    return objective;
+  }
+
   private async createPlan(objective: string, goalId: string, signal?: AbortSignal): Promise<GoalContract> {
+    // Grill Me preflight: freeze immutable contract before planning
+    const refined = await this.grillMePreflight(objective, signal);
+    if (refined === null) throw new Error("Grill Me cancelled");
+    const finalObjective = refined;
     let feedback: string[] = [];
     let planTier: "super" | "ultra" = "super";
     let lastPlan: PlanPayload | null = null;
@@ -202,7 +224,7 @@ export class GoalOrchestrator {
     for (let repair = 0; repair <= this.config.execution.planCriticRepairsBeforeUltra + 2; repair++) {
       if (repair >= this.config.execution.planCriticRepairsBeforeUltra) planTier = "ultra";
       this.notify(`Planning goal${planTier === "ultra" ? " (escalated to Ultra)" : ""}...`);
-      const planner = await this.runAgent(null, "planner", plannerTask(objective, this.cwd, feedback), planTier, readOnlyTools(), signal);
+      const planner = await this.runAgent(null, "planner", plannerTask(finalObjective, this.cwd, feedback), planTier, readOnlyTools(), signal);
       if (planner.exitCode !== 0) {
         feedback = [`Planner process failed: ${shortText(planner.stderr || planner.errorMessage || "unknown", 1200)}`];
         continue;
@@ -210,14 +232,14 @@ export class GoalOrchestrator {
       try { lastPlan = extractJson<PlanPayload>(planner.output); }
       catch (e) { feedback = [`Planner returned invalid JSON: ${(e as Error).message}`]; continue; }
 
-      const normalized = normalizePlan(lastPlan, objective);
+      const normalized = normalizePlan(lastPlan, finalObjective);
       const dagIssues = validateDag(normalized.tasks);
       if (dagIssues.length) {
         feedback = dagIssues;
         continue;
       }
 
-      const critic = await this.runAgent(null, "plan-critic", criticTask(lastPlan, objective), planTier, readOnlyTools(), signal);
+      const critic = await this.runAgent(null, "plan-critic", criticTask(lastPlan, finalObjective), planTier, readOnlyTools(), signal);
       if (critic.exitCode !== 0) { feedback = [`Plan critic failed: ${shortText(critic.stderr, 1000)}`]; continue; }
       let verdict: CriticPayload;
       try { verdict = extractJson<CriticPayload>(critic.output); }
@@ -231,8 +253,8 @@ export class GoalOrchestrator {
       const created = now();
       const goal: GoalContract = {
         id: goalId,
-        objective,
-        immutableObjective: objective,
+        objective: finalObjective,
+        immutableObjective: finalObjective,
         createdAt: created,
         updatedAt: created,
         status: "planning",
@@ -343,11 +365,14 @@ export class GoalOrchestrator {
       saveGoal(this.cwd, goal);
       return;
     }
-    if (equivalent >= this.config.execution.maxEquivalentFailures && route.tier === "ultra") {
-      task.status = "blocked";
-      goal.status = "blocked";
-      goal.blockedReason = `Repeated equivalent failure ${signature} after Ultra escalation on ${task.id}.`;
-      saveGoal(this.cwd, goal);
+    // Autonomous-until-complete: on equivalent failure limit, force planner replan instead of blocking
+    if (equivalent >= this.config.execution.maxEquivalentFailures) {
+      // Force a planner repair with a materially different strategy
+      task.status = "pending";
+      task.risk = "high";
+      task.parallelSafe = false;
+      this.decisions.push({ kind: "planner-repair", selected: "planner", reason: `Equivalent failure limit reached (${signature}); forcing replan` });
+      await this.plannerRepair(goal, task, raw, signal);
       return;
     }
 

@@ -250,8 +250,10 @@ export async function runPiAgent(options: RunAgentOptions): Promise<AgentRunResu
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
   };
 
-  const maxAttempts = 1 + Math.max(0, Math.min(options.maxRetries ?? 3, 5));
-  const baseDelay = Math.max(500, options.retryDelayMs ?? 4000);
+  const maxAttempts = 1 + Math.max(0, Math.min(options.maxRetries ?? 3, 8));
+  // Exponential backoff: base × 2^(attempt-1). Default base=10s → 10,20,40,80,160s
+  const baseDelay = Math.max(1000, options.retryDelayMs ?? 10000);
+  const customDelays = Array.from({ length: maxAttempts - 1 }, (_, i) => baseDelay * Math.pow(2, i));
 
   try {
     const invocation = options.piInvocation
@@ -289,10 +291,10 @@ export async function runPiAgent(options: RunAgentOptions): Promise<AgentRunResu
       if (!isTransient(ar)) break;
       if (attempt >= maxAttempts) break;
 
-      const delay = baseDelay * Math.pow(2, attempt - 1);
-      options.onProgress?.(
-        `transient provider error (exit ${ar.exitCode}); retry ${attempt}/${maxAttempts - 1} in ${Math.round(delay / 1000)}s`,
-      );
+      const delay = customDelays[attempt - 1] ?? customDelays[customDelays.length - 1];
+      const msg = `transient provider error (exit ${ar.exitCode}); retry ${attempt}/${maxAttempts - 1} in ${Math.round(delay / 1000)}s (delays: ${customDelays.map(d => Math.round(d/1000)).join('s, ')}s)`;
+      options.onProgress?.(msg);
+      console.error(`[RETRY ${attempt}/${maxAttempts - 1}] ${msg}`);
       await sleep(delay);
     }
     return result;

@@ -1,11 +1,21 @@
 import * as fs from "node:fs";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+// Pi extension types (peer dependency - types not available at compile time)
+interface ExtensionAPI {
+  registerCommand(name: string, def: { description: string; handler: (args: string, ctx: CommandContext) => Promise<void> }): void;
+  on(event: string, handler: (event: any, ctx: any) => Promise<any>): void;
+}
+interface CommandContext {
+  cwd: string;
+  ui: { notify(msg: string, level?: string): void; confirm(msg: string, detail?: string): Promise<boolean>; select(msg: string, options: Array<{ name: string; value: string }>): Promise<string | undefined>; hasUI: boolean; setStatus?(key: string, msg?: string): void };
+  hasUI: boolean;
+}
 import { GoalOrchestrator } from "./orchestrator.ts";
 import { loadConfig, loadTools, saveConfig, saveTools, setConfigPath } from "./config.ts";
 import { executableExists } from "./checks.ts";
 import { compactGoalSummary } from "./context.ts";
-import { loadRules, pathsFor } from "./store.ts";
+import { loadRules, pathsFor, saveGoal, appendEvent } from "./store.ts";
 import { pruneToolContext } from "./context-pruner.ts";
+import type { GoalContract } from "./types.ts";
 
 let activeController: AbortController | null = null;
 let activeRun: Promise<void> | null = null;
@@ -32,17 +42,19 @@ async function runInForeground(orchestrator: GoalOrchestrator, operation: (signa
       if (goal?.status === "completed") ui.notify("Goal verified complete.", "success");
       else if (goal?.status === "blocked") ui.notify(`Goal blocked: ${goal.blockedReason ?? "see /goal-status"}`, "warning");
       else if (goal?.status === "failed") ui.notify(`Goal failed: ${goal.blockedReason ?? "see /goal-status"}`, "error");
-    })
-    .catch((error) => ui.notify(`Goal run error: ${error instanceof Error ? error.message : String(error)}`, "error"))
-    .finally(() => {
+      else if (goal?.status === "paused") ui.notify("Goal paused.", "warning");
       activeRun = null;
       activeController = null;
-      ui.setStatus?.("goal-graph", undefined);
+    })
+    .catch((err) => {
+      ui.notify(`Goal run error: ${err}`, "error");
+      activeRun = null;
+      activeController = null;
     });
   await activeRun;
 }
 
-function runInBackground(orchestrator: GoalOrchestrator, operation: (signal: AbortSignal) => Promise<any>, ui: any): void {
+async function runInBackground(orchestrator: GoalOrchestrator, operation: (signal: AbortSignal) => Promise<any>, ui: any): Promise<void> {
   if (activeRun) {
     ui.notify("A goal run is already active. Use /goal-status or /goal-pause.", "warning");
     return;
@@ -51,21 +63,23 @@ function runInBackground(orchestrator: GoalOrchestrator, operation: (signal: Abo
   const signal = activeController.signal;
   activeRun = operation(signal)
     .then((goal) => {
-      if (goal?.status === "completed") ui.notify("Goal verified complete.", "success");
+      if (goal?.status === "completed") ui.notify("Goal completed (background).", "success");
       else if (goal?.status === "blocked") ui.notify(`Goal blocked: ${goal.blockedReason ?? "see /goal-status"}`, "warning");
       else if (goal?.status === "failed") ui.notify(`Goal failed: ${goal.blockedReason ?? "see /goal-status"}`, "error");
-    })
-    .catch((error) => ui.notify(`Goal run error: ${error instanceof Error ? error.message : String(error)}`, "error"))
-    .finally(() => {
+      else if (goal?.status === "paused") ui.notify("Goal paused.", "warning");
       activeRun = null;
       activeController = null;
-      ui.setStatus?.("goal-graph", undefined);
+    })
+    .catch((err) => {
+      ui.notify(`Goal run error: ${err}`, "error");
+      activeRun = null;
+      activeController = null;
     });
 }
 
 async function promptRunMode(ui: any, defaultToForeground: boolean = true): Promise<"foreground" | "background"> {
   if (!ui.hasUI) return defaultToForeground ? "foreground" : "background";
-  const choice = await ctx.ui.select("Run mode?", [
+  const choice = await ui.select("Run mode?", [
     { name: "Foreground (see live progress)", value: "foreground" },
     { name: "Background (run in background)", value: "background" },
   ]);
@@ -83,7 +97,7 @@ async function runWithMode(orchestrator: GoalOrchestrator, operation: (signal: A
 export default function (pi: ExtensionAPI) {
   // Child Pi processes are isolated workers. They only load the reversible context pruner;
   // orchestration commands stay in the parent process.
-  if (process.env.PI_GOAL_GRAPH_CHILD === "1") {
+  if (process.env.PI_AUTOGRAPH_CHILD === "1") {
     pi.on("context", async (event: any, ctx: any) => {
       try {
         const config = loadConfig(pathsFor(ctx.cwd).configFile);
@@ -109,10 +123,19 @@ export default function (pi: ExtensionAPI) {
     activeController?.abort();
   });
 
-  const make = (cwd: string, ui: any) => new GoalOrchestrator(cwd, {
-    notify: (message, level = "info") => ui.notify(message, level),
-    status: (message) => ui.setStatus?.("goal-graph", message ?? undefined),
-  });
+  function make(cwd: string, ui: any) {
+    return new GoalOrchestrator(cwd, {
+      notify: (message: string, level?: "info" | "success" | "warning" | "error") => ui.notify(message, level),
+      status: (message: string | null) => ui.setStatus?.("goal-graph", message ?? undefined),
+      grill: async (objective: string) => {
+        if (!ui.hasUI) return objective;
+        const confirmed = await ui.confirm("Grill Me: Resolve ambiguities before planning?", objective);
+        if (!confirmed) return null;
+        const refined = await ui.input("Refined objective (press Enter to keep as-is):", objective);
+        return refined?.trim() || objective;
+      },
+    });
+  }
 
   pi.registerCommand("goal-direct", {
     description: "Start an autonomous graph goal immediately: /goal-direct <objective>",
@@ -120,10 +143,9 @@ export default function (pi: ExtensionAPI) {
       const objective = args.trim();
       if (!objective) { ctx.ui.notify("Usage: /goal-direct <objective>", "warning"); return; }
       const o = make(ctx.cwd, ctx.ui);
-      const mode = await promptRunMode(ctx.ui, true);
-      await runWithMode(o, (signal) => o.start(objective, signal), ctx.ui, mode);
-      const msg = mode === "foreground" ? "Goal Graph started in foreground. Use /goal-status to inspect progress." : "Goal Graph started in the background. Use /goal-status to inspect it.";
-      ctx.ui.notify(msg, "info");
+      // Default to foreground (no prompt)
+      await runInForeground(o, (signal) => o.start(objective, signal), ctx.ui);
+      ctx.ui.notify("Goal Graph started in foreground. Use /goal-status to inspect progress.", "info");
     },
   });
 
@@ -135,10 +157,9 @@ export default function (pi: ExtensionAPI) {
       const ok = ctx.hasUI ? await ctx.ui.confirm("Start Goal Graph?", objective) : true;
       if (!ok) return;
       const o = make(ctx.cwd, ctx.ui);
-      const mode = await promptRunMode(ctx.ui, true);
-      await runWithMode(o, (signal) => o.start(objective, signal), ctx.ui, mode);
-      const msg = mode === "foreground" ? "Goal Graph started in foreground. Use /goal-status to inspect progress." : "Goal Graph started in the background. Use /goal-status to inspect it.";
-      ctx.ui.notify(msg, "info");
+      // Default to foreground (no prompt)
+      await runInForeground(o, (signal) => o.start(objective, signal), ctx.ui);
+      ctx.ui.notify("Goal Graph started in foreground. Use /goal-status to inspect progress.", "info");
     },
   });
 
@@ -177,9 +198,72 @@ export default function (pi: ExtensionAPI) {
       const goal = o.getActiveGoal();
       if (!goal) { ctx.ui.notify("No persisted goal to resume.", "warning"); return; }
       if (goal.status === "completed") { ctx.ui.notify("The active goal is already completed.", "info"); return; }
-      const mode = await promptRunMode(ctx.ui, true);
-      await runWithMode(o, (signal) => o.resume(signal), ctx.ui, mode);
+      // Default to foreground (no prompt)
+      await runInForeground(o, (signal) => o.resume(signal), ctx.ui);
       ctx.ui.notify(`Resuming ${goal.id}.`, "info");
+    },
+  });
+
+  pi.registerCommand("goal-stop", {
+    description: "Permanently stop the active goal gracefully (marks as failed, non-resumable)",
+    handler: async (_args, ctx) => {
+      const o = make(ctx.cwd, ctx.ui);
+      const goal = o.getActiveGoal();
+      if (!goal) { ctx.ui.notify("No active goal to stop.", "warning"); return; }
+      if (goal.status === "completed") { ctx.ui.notify("Goal already completed.", "info"); return; }
+      
+      // Abort any running process first
+      if (activeController) {
+        activeController.abort();
+        // Wait for the run to settle (it will catch abort and mark paused)
+        if (activeRun) {
+          try { await activeRun; } catch { /* ignore */ }
+        }
+      }
+      
+      // Mark goal as permanently stopped (failed, non-resumable)
+      goal.status = "failed";
+      goal.blockedReason = "Stopped by user";
+      saveGoal(ctx.cwd, goal);
+      appendEvent(ctx.cwd, goal.id, "stopped_by_user", {});
+      ctx.ui.notify(`Goal ${goal.id} stopped permanently.`, "info");
+    },
+  });
+
+  pi.registerCommand("goal-kill", {
+    description: "Immediately terminate all goal workers and abort (force kill)",
+    handler: async (_args, ctx) => {
+      if (!activeController && !activeRun) { 
+        ctx.ui.notify("No active goal run to kill.", "info"); 
+        return; 
+      }
+      
+      // Abort and force-kill: pi-runner will kill child processes on abort
+      if (activeController) {
+        activeController.abort();
+      }
+      
+      // Wait briefly for run to settle, then force reset
+      if (activeRun) {
+        try {
+          await Promise.race([activeRun, new Promise(r => setTimeout(r, 3000))]);
+        } catch { /* ignore */ }
+      }
+      
+      // Mark goal as killed if exists
+      const o = make(ctx.cwd, ctx.ui);
+      const goal = o.getActiveGoal();
+      if (goal && goal.status !== "completed") {
+        goal.status = "failed";
+        goal.blockedReason = "Killed by user";
+        saveGoal(ctx.cwd, goal);
+        appendEvent(ctx.cwd, goal.id, "killed_by_user", {});
+      }
+      
+      // Force reset state
+      activeRun = null;
+      activeController = new AbortController();
+      ctx.ui.notify("All goal workers killed.", "warning");
     },
   });
 

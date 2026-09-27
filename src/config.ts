@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { GoalGraphConfig, ToolRegistry } from "./types.ts";
 
 export const DEFAULT_CONFIG: GoalGraphConfig = {
-  version: "0.4.0",
+  version: "0.6.0",
   models: {
     default: "nvidia/nvidia/nemotron-3-super-120b-a12b",
     escalation: "nvidia/nvidia/nemotron-3-ultra-550b-a55b",
@@ -18,6 +18,9 @@ export const DEFAULT_CONFIG: GoalGraphConfig = {
   },
   decisionEngine: {
     provider: "heuristic",
+    layaLocalModel: "nvidia/nemotron-mini-4b-instruct",
+    layaHFEndpoint: "",
+    layaHFToken: "",
     confidenceEscalationThreshold: 0.75,
   },
   review: {
@@ -40,7 +43,7 @@ export const DEFAULT_CONFIG: GoalGraphConfig = {
     planCriticRepairsBeforeUltra: 2,
     reviewerRepairCycles: 3,
     auditRepairCycles: 3,
-    retryWorkerOnTransient: 3,
+    retryWorkerOnTransient: 5,
     maxCostUsd: null,
     runInBackground: false,
   },

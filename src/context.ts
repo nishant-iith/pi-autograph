@@ -44,7 +44,46 @@ export function compactGoalSummary(goal: GoalContract): string {
   const done = goal.tasks.filter((t) => t.status === "completed").length;
   const pending = goal.tasks.filter((t) => t.status === "pending").length;
   const failed = goal.tasks.filter((t) => t.status === "failed" || t.status === "blocked").length;
-  return shortText(`Goal ${goal.id} [${goal.status}]\n${goal.immutableObjective}\nTasks: ${done} completed, ${pending} pending, ${failed} failed/blocked.\nCriteria: ${goal.acceptanceCriteria.map((a) => `${a.id}:${a.status}`).join(", ")}`, 3000);
+  const running = goal.tasks.filter((t) => t.status === "running");
+  
+  // Elapsed time
+  const start = new Date(goal.createdAt).getTime();
+  const end = goal.completedAt ? new Date(goal.completedAt).getTime() : Date.now();
+  const elapsedSec = Math.round((end - start) / 1000);
+  const elapsed = elapsedSec >= 3600 ? `${Math.floor(elapsedSec/3600)}h ${Math.floor((elapsedSec%3600)/60)}m` : elapsedSec >= 60 ? `${Math.floor(elapsedSec/60)}m ${elapsedSec%60}s` : `${elapsedSec}s`;
+  
+  // Current stage/wave
+  const runningIds = running.map(t => t.id).join(", ") || "none";
+  const waveIdx = calculateWaveIndex(goal.tasks);
+  
+  // Context usage estimate
+  const totalEvidence = goal.tasks.reduce((acc, t) => acc + (t.rawOutputRef ? 1 : 0), 0);
+  
+  const lines = [
+    `Goal ${goal.id} [${goal.status}]`,
+    goal.immutableObjective,
+    `Tasks: ${done} done, ${pending} pending, ${failed} failed, ${running.length} running`,
+    `Stage: wave ${waveIdx + 1} | Running: ${runningIds}`,
+    `Elapsed: ${elapsed} | Total tokens: ${goal.tasks.reduce((a,t) => a + (t.modelHistory?.length || 0), 0)}`,
+    `Criteria: ${goal.acceptanceCriteria.map((a) => `${a.id}:${a.status}`).join(", ")}`,
+  ];
+  return shortText(lines.join("\n"), 3000);
+}
+
+function calculateWaveIndex(tasks: GoalContract["tasks"]): number {
+  const deps = new Set(tasks.flatMap(t => t.dependencies));
+  let wave = 0;
+  // Simple walk: count how many upstream dependencies each pending/running task has resolved
+  const done = new Set(tasks.filter(t => t.status === "completed").map(t => t.id));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const newWave = tasks.filter(t => t.status === "pending" || t.status === "running")
+      .filter(t => t.dependencies.every(d => done.has(d)));
+    newWave.forEach(t => { done.add(t.id); changed = true; });
+    if (changed) wave++;
+  }
+  return wave;
 }
 
 export function hotEvidence(records: EvidenceRecord[], maxChars: number): EvidenceRecord[] {
