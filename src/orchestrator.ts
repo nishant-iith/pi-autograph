@@ -9,6 +9,7 @@ import type {
   GoalGraphConfig,
   GoalTask,
   Lesson,
+  ModelTier,
   ReviewResult,
   ToolRegistry,
 } from "./types.ts";
@@ -550,6 +551,7 @@ export class GoalOrchestrator {
 
   /**
    * Completion recovery: after exhausting repair cycles, re-enter Planner with accumulated failure evidence.
+   * Recovery tasks get unique IDs, run sequentially, and re-run the full check+review pipeline afterwards.
    */
   private async completionRecovery(goal: GoalContract, checks: CheckResult[], review: ReviewResult, audit: AuditResult, signal?: AbortSignal): Promise<ReviewResult> {
     const evidence = [
@@ -558,33 +560,53 @@ export class GoalOrchestrator {
       `Missing work: ${normalizeStringArray(audit.missingWork).join("; ")}`,
       `Failed checks: ${checks.filter(c => c.exitCode !== 0 || c.timedOut).map(c => c.name).join(", ")}`,
     ].join("\n");
-    const plannerTier = goal.tasks.some(t => t.attempts > 0) ? "ultra" : "super";
-    const prompt = `IMMUTABLE GOAL: ${goal.immutableObjective}\nCurrent tasks:\n${goal.tasks.map(t => `- ${t.id} [${t.status}] ${t.title} (${t.role}/${t.mode})`).join("\n")}\n\nFAILURE EVIDENCE:\n${evidence}\n\nGenerate a REPAIR PLAN: 1-3 new tasks to address ONLY the blocking failures. Prefer different approach. Return ONLY JSON:
-{"summary":"...","acceptanceCriteria":[...],"tasks":[...]}`;
+    const existingIds = new Set(goal.tasks.map((t) => t.id));
+    const recoveryPrefix = `recovery-${goal.tasks.filter((t) => t.id.startsWith("recovery-")).length}-${Date.now().toString(36)}`;
+    const plannerTier: "super" | "ultra" = goal.tasks.some((t) => t.attempts > 0) ? "ultra" : "super";
+    const prompt = `IMMUTABLE GOAL: ${goal.immutableObjective}\nCurrent tasks:\n${goal.tasks.map((t) => `- ${t.id} [${t.status}] ${t.title} (${t.role}/${t.mode})`).join("\n")}\n\nFAILURE EVIDENCE:\n${evidence}\n\nGenerate a REPAIR PLAN: 1-3 new tasks to address ONLY the blocking failures. Prefer different approach.\nIDs must be prefixed '${recoveryPrefix}-'. Return ONLY JSON:\n{"summary":"...","acceptanceCriteria":[...],"tasks":[...]}`;
     const run = await this.runAgent(goal, "planner", prompt, plannerTier, readOnlyTools(), signal);
     let recoveryPlan: PlanPayload;
     try { recoveryPlan = extractJson<PlanPayload>(run.output); } catch {
       return { pass: false, summary: "Recovery planner returned invalid output", findings: [] };
     }
-    const recoveryTasks = normalizePlan(recoveryPlan, goal.immutableObjective).tasks.map((t, i) => ({
-      ...t,
-      id: `recovery-${i + 1}`,
-      dependencies: [],
-      status: "pending" as const,
-      attempts: 0,
-      modelHistory: [],
-      risk: "high" as const,
-      parallelSafe: false,
-    }));
+    const recoveryTasks = normalizePlan(recoveryPlan, goal.immutableObjective).tasks
+      .slice(0, 3)
+      .map((t, i) => {
+        const id = `${recoveryPrefix}-${i + 1}`;
+        if (existingIds.has(id)) throw new Error(`Recovery task id collision: ${id}`);
+        return {
+          ...t,
+          id,
+          dependencies: [] as string[],
+          status: "pending" as const,
+          attempts: 0,
+          modelHistory: [] as ModelTier[],
+          risk: "high" as const,
+          parallelSafe: false,
+        };
+      });
+    if (recoveryTasks.length === 0) return { pass: false, summary: "Recovery plan produced no tasks", findings: [] };
     goal.tasks.push(...recoveryTasks);
     saveGoal(this.cwd, goal);
-    appendEvent(this.cwd, goal.id, "recovery_planning", { newTasks: recoveryTasks.map(t => t.id) });
-    const recoveryWave = buildWave(goal.tasks, 1);
-    for (const task of recoveryWave) {
+    appendEvent(this.cwd, goal.id, "recovery_planning", { newTasks: recoveryTasks.map((t) => t.id) });
+
+    // Execute sequentially — recovery writes are deliberately serialized.
+    for (const task of recoveryTasks) {
+      if (signal?.aborted) throw new Error("Goal paused");
       if (task.status !== "pending") continue;
       await this.executeTask(goal, task, signal);
+      if ((task.status as string) !== "completed") {
+        return { pass: false, summary: `Recovery task ${task.id} did not complete`, findings: [] };
+      }
     }
-    return this.independentReview(goal, checks, signal);
+
+    // Rerun deterministic checks, repair them, then re-review.
+    let fresh = await this.runChecks(goal, signal);
+    fresh = await this.repairFailedChecks(goal, fresh, signal);
+    if (!requiredChecksPass(fresh)) {
+      return { pass: false, summary: "Recovery: checks still failing", findings: [] };
+    }
+    return this.independentReview(goal, fresh, signal);
   }
 
   private async audit(goal: GoalContract, checks: CheckResult[], review: ReviewResult, signal?: AbortSignal): Promise<AuditResult> {

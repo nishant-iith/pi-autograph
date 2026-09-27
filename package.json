@@ -35,6 +35,7 @@
     "typecheck": "node tests/typecheck.mjs"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.87.1",
     "@types/node": "^26.6.3",
     "typescript": "^7.0.2"
   }

@@ -9,7 +9,7 @@ export type AgentRole =
   | "auditor"
   | "reflection";
 
-export type GoalStatus = "planning" | "running" | "paused" | "blocked" | "completed" | "failed";
+export type GoalStatus = "planning" | "running" | "paused" | "blocked" | "completed" | "failed" | "cancelled" | "aborted";
 export type TaskStatus = "pending" | "running" | "completed" | "failed" | "blocked" | "skipped";
 export type TaskMode = "read" | "write";
 export type ModelTier = "super" | "ultra";

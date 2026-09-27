@@ -94,60 +94,104 @@ export class HeuristicDecisionEngine implements DecisionEngine {
 }
 
 /**
- * Laya Local - runs Laya as an isolated Pi task with a local model.
- * Uses the existing runIsolatedPiTask infrastructure.
+ * Laya Local - calls an OpenAI-compatible local endpoint (Ollama / llama.cpp / NIM / vLLM).
+ * Hits the endpoint directly via fetch; no Pi process per call, so per-decision cost is <100ms once warm.
  */
 export class LayaLocalDecisionEngine implements DecisionEngine {
   name = "laya-local";
-  constructor(private readonly config: GoalGraphConfig, private readonly cwd: string) {}
+  private readonly fallback = new HeuristicDecisionEngine();
+  private readonly cache = new Map<string, RouterDecision | FailureDecision>();
+  private healthy: boolean | null = null;
 
-  private async runLaya(prompt: string): Promise<RouterDecision | FailureDecision | null> {
-    // Dynamic import to avoid circular dependency
-    const { runPiAgent } = await import("./pi-runner.ts");
-    const model = this.config.decisionEngine.layaLocalModel ?? "nvidia/nemotron-mini-4b-instruct";
-    
-    const result = await runPiAgent({
-      cwd: this.cwd,
-      role: "planner",
-      task: prompt,
-      systemPrompt: "You are Laya, a fast task router. Output ONLY the requested JSON.",
-      model,
-      modelTier: "super",
-      tools: [],
-      signal: new AbortSignal(),
-      timeoutMs: 15000,
-    });
+  constructor(private readonly config: GoalGraphConfig, private readonly cwd: string, private readonly maxCacheSize = 512) {}
 
-    if (result.exitCode !== 0 || !result.output.trim()) {
-      return null;
-    }
+  private endpoint(): string | null {
+    const ep = this.config.decisionEngine.layaHFEndpoint?.trim();
+    if (!ep) return null;
+    return ep.endsWith("/chat/completions") ? ep : `${ep.replace(/\/$/, "")}/v1/chat/completions`;
+  }
+
+  private model(): string {
+    return this.config.decisionEngine.layaLocalModel || "nemotron-mini-4b-instruct";
+  }
+
+  private async runLaya(prompt: string, cacheKey: string): Promise<RouterDecision | FailureDecision | null> {
+    if (this.healthy === false) return this.fallback.chooseModel({ task: { id: "", title: "", description: "", role: "coder", mode: "read", dependencies: [], acceptanceCriteria: [], filesHint: [], parallelSafe: false, risk: "low", status: "pending", attempts: 0, modelHistory: [] }, repeatedFailureCount: 0 });
+    const cached = this.cache.get(cacheKey);
+    if (cached) return cached;
+    const url = this.endpoint();
+    if (!url) return this.fallback.chooseModel({ task: { id: "", title: "", description: "", role: "coder", mode: "read", dependencies: [], acceptanceCriteria: [], filesHint: [], parallelSafe: false, risk: "low", status: "pending", attempts: 0, modelHistory: [] }, repeatedFailureCount: 0 });
     try {
-      return JSON.parse(result.output.trim());
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: this.model(), messages: [{ role: "user", content: prompt }], max_tokens: 256, temperature: 0 }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) { this.healthy = false; return null; }
+      const data: unknown = await res.json();
+      const first = (data as { choices?: Array<{ message?: { content?: string } }> })?.choices?.[0]?.message?.content ?? "";
+      const parsed = JSON.parse(first.trim());
+      this.cacheDecision(cacheKey, parsed);
+      return parsed;
     } catch {
+      this.healthy = false;
       return null;
     }
   }
 
-  async chooseModel(input: {
-    task: GoalTask;
-    repeatedFailureCount: number;
-    disputedReview?: boolean;
-    auditAmbiguous?: boolean;
-  }): Promise<RouterDecision | null> {
+  private cacheDecision(key: string, value: RouterDecision | FailureDecision): void {
+    if (this.cache.size >= this.maxCacheSize) {
+      const first = this.cache.keys().next().value;
+      if (first !== undefined) this.cache.delete(first);
+    }
+    this.cache.set(key, value);
+  }
+
+  private keyForChoose(input: { task: GoalTask; repeatedFailureCount: number; disputedReview?: boolean; auditAmbiguous?: boolean }): string {
+    return `choose:${input.task.role}:${input.task.mode}:${input.task.risk}:${input.repeatedFailureCount}:${!!input.disputedReview}:${!!input.auditAmbiguous}`;
+  }
+
+  private keyForFailure(input: { output: string; task?: GoalTask }): string {
+    const sig = failureSignature(input.output);
+    return `fail:${sig}:${input.task?.role ?? "?"}`;
+  }
+
+  async chooseModel(input: { task: GoalTask; repeatedFailureCount: number; disputedReview?: boolean; auditAmbiguous?: boolean; }): Promise<RouterDecision | null> {
+    const key = this.keyForChoose(input);
     const prompt = buildChooseModelPrompt(input);
-    return this.runLaya(prompt) as Promise<RouterDecision | null>;
+    const out = await this.runLaya(prompt, key);
+    return (out && "tier" in out ? out : null) as RouterDecision | null;
   }
 
   async classifyFailure(input: { output: string; task?: GoalTask }): Promise<FailureDecision | null> {
+    const key = this.keyForFailure(input);
     const prompt = buildClassifyFailurePrompt(input);
-    return this.runLaya(prompt) as Promise<FailureDecision | null>;
+    const out = await this.runLaya(prompt, key);
+    return (out && "route" in out ? out : null) as FailureDecision | null;
   }
 
   async healthCheck(): Promise<boolean> {
+    if (this.healthy !== null) return this.healthy;
+    const url = this.endpoint();
+    if (!url) { this.healthy = false; return false; }
     try {
-      const result = await this.runLaya('Test: output {"tier":"super","reason":"health","confidence":1}');
-      return result !== null && "tier" in result && result.tier === "super";
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3000);
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: this.model(), messages: [{ role: "user", content: "ping" }], max_tokens: 4 }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      this.healthy = res.ok;
+      return this.healthy;
     } catch {
+      this.healthy = false;
       return false;
     }
   }
@@ -241,17 +285,43 @@ export class LayaPlaceholderDecisionEngine implements DecisionEngine {
 
 export function makeDecisionEngine(config: GoalGraphConfig, cwd: string): DecisionEngine {
   const de = config.decisionEngine;
+  let engine: DecisionEngine;
   switch (de.provider) {
     case "laya-local":
-      return new LayaLocalDecisionEngine(config, cwd);
+      engine = new LayaLocalDecisionEngine(config, cwd);
+      break;
     case "laya-hf":
-      return new LayaHFDecisionEngine(config);
+      engine = new LayaHFDecisionEngine(config);
+      break;
     case "laya-placeholder":
-      return new LayaPlaceholderDecisionEngine();
+      engine = new LayaPlaceholderDecisionEngine();
+      break;
     case "heuristic":
     default:
-      return new HeuristicDecisionEngine();
+      engine = new HeuristicDecisionEngine();
+      break;
   }
+  // Fallback chain: if the chosen Laya provider isn't healthy, fall through to heuristic.
+  if (de.provider === "laya-local" || de.provider === "laya-hf") {
+    return new LayaWithFallback(engine);
+  }
+  return engine;
+}
+
+/** Wrap a maybe-unhealthy Laya engine and drop back to heuristics when the first health check fails. */
+export class LayaWithFallback implements DecisionEngine {
+  readonly name: string;
+  private healthy: boolean | null = null;
+  constructor(private readonly inner: DecisionEngine, private readonly heuristic = new HeuristicDecisionEngine()) {
+    this.name = `${inner.name}:checked`;
+  }
+  private async pick(): Promise<DecisionEngine> {
+    if (this.healthy === null) this.healthy = await this.inner.healthCheck();
+    return this.healthy ? this.inner : this.heuristic;
+  }
+  async chooseModel(input: Parameters<DecisionEngine["chooseModel"]>[0]) { return (await this.pick()).chooseModel(input); }
+  async classifyFailure(input: Parameters<DecisionEngine["classifyFailure"]>[0]) { return (await this.pick()).classifyFailure(input); }
+  async healthCheck(): Promise<boolean> { return (await this.pick()).healthCheck(); }
 }
 
 export async function routeModel(

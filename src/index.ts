@@ -1,24 +1,13 @@
-import * as fs from "node:fs";
-// Pi extension types (peer dependency - types not available at compile time)
-interface ExtensionAPI {
-  registerCommand(name: string, def: { description: string; handler: (args: string, ctx: CommandContext) => Promise<void> }): void;
-  on(event: string, handler: (event: any, ctx: any) => Promise<any>): void;
-}
-interface CommandContext {
-  cwd: string;
-  ui: { notify(msg: string, level?: string): void; confirm(msg: string, detail?: string): Promise<boolean>; select(msg: string, options: Array<{ name: string; value: string }>): Promise<string | undefined>; hasUI: boolean; setStatus?(key: string, msg?: string): void };
-  hasUI: boolean;
-}
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { GoalOrchestrator } from "./orchestrator.ts";
 import { loadConfig, loadTools, saveConfig, saveTools, setConfigPath } from "./config.ts";
 import { executableExists } from "./checks.ts";
 import { compactGoalSummary } from "./context.ts";
 import { loadRules, pathsFor, saveGoal, appendEvent } from "./store.ts";
 import { pruneToolContext } from "./context-pruner.ts";
-import type { GoalContract } from "./types.ts";
 
 let activeController: AbortController | null = null;
-let activeRun: Promise<void> | null = null;
+let activeRun: Promise<unknown> | null = null;
 
 function fmtGraph(goal: ReturnType<GoalOrchestrator["getActiveGoal"]>): string {
   if (!goal) return "No active goal.";
@@ -30,75 +19,59 @@ function fmtGraph(goal: ReturnType<GoalOrchestrator["getActiveGoal"]>): string {
   return lines.join("\n");
 }
 
-async function runInForeground(orchestrator: GoalOrchestrator, operation: (signal: AbortSignal) => Promise<any>, ui: any): Promise<void> {
+function notifyGoalResult(ui: ExtensionCommandContext["ui"], goal: { status?: string; blockedReason?: string } | null | undefined, bg: boolean): void {
+  const suffix = bg ? " (background)" : "";
+  if (goal?.status === "completed") ui.notify(`Goal verified complete.${suffix}`, "info");
+  else if (goal?.status === "blocked") ui.notify(`Goal blocked: ${goal.blockedReason ?? "see /goal-status"}`, "warning");
+  else if (goal?.status === "failed") ui.notify(`Goal failed: ${goal.blockedReason ?? "see /goal-status"}`, "error");
+  else if (goal?.status === "cancelled") ui.notify("Goal was stopped by user.", "info");
+  else if (goal?.status === "aborted") ui.notify("Goal workers were killed.", "warning");
+  else if (goal?.status === "paused") ui.notify("Goal paused.", "warning");
+}
+
+async function runInForeground(orchestrator: GoalOrchestrator, operation: (signal: AbortSignal) => Promise<any>, ui: ExtensionCommandContext["ui"]): Promise<void> {
   if (activeRun) {
     ui.notify("A goal run is already active. Use /goal-status or /goal-pause.", "warning");
     return;
   }
   activeController = new AbortController();
   const signal = activeController.signal;
-  activeRun = operation(signal)
-    .then((goal) => {
-      if (goal?.status === "completed") ui.notify("Goal verified complete.", "success");
-      else if (goal?.status === "blocked") ui.notify(`Goal blocked: ${goal.blockedReason ?? "see /goal-status"}`, "warning");
-      else if (goal?.status === "failed") ui.notify(`Goal failed: ${goal.blockedReason ?? "see /goal-status"}`, "error");
-      else if (goal?.status === "paused") ui.notify("Goal paused.", "warning");
-      activeRun = null;
-      activeController = null;
-    })
-    .catch((err) => {
-      ui.notify(`Goal run error: ${err}`, "error");
-      activeRun = null;
-      activeController = null;
-    });
-  await activeRun;
+  const run = operation(signal);
+  activeRun = run;
+  try {
+    const goal = await run;
+    notifyGoalResult(ui, goal, false);
+  } catch (err) {
+    ui.notify(`Goal run error: ${err}`, "error");
+  } finally {
+    activeRun = null;
+    activeController = null;
+  }
 }
 
-async function runInBackground(orchestrator: GoalOrchestrator, operation: (signal: AbortSignal) => Promise<any>, ui: any): Promise<void> {
+function runInBackground(orchestrator: GoalOrchestrator, operation: (signal: AbortSignal) => Promise<any>, ui: ExtensionCommandContext["ui"]): void {
   if (activeRun) {
     ui.notify("A goal run is already active. Use /goal-status or /goal-pause.", "warning");
     return;
   }
   activeController = new AbortController();
   const signal = activeController.signal;
-  activeRun = operation(signal)
-    .then((goal) => {
-      if (goal?.status === "completed") ui.notify("Goal completed (background).", "success");
-      else if (goal?.status === "blocked") ui.notify(`Goal blocked: ${goal.blockedReason ?? "see /goal-status"}`, "warning");
-      else if (goal?.status === "failed") ui.notify(`Goal failed: ${goal.blockedReason ?? "see /goal-status"}`, "error");
-      else if (goal?.status === "paused") ui.notify("Goal paused.", "warning");
-      activeRun = null;
-      activeController = null;
-    })
-    .catch((err) => {
-      ui.notify(`Goal run error: ${err}`, "error");
+  const run = operation(signal);
+  activeRun = run;
+  run
+    .then((goal) => notifyGoalResult(ui, goal, true))
+    .catch((err) => ui.notify(`Goal run error: ${err}`, "error"))
+    .finally(() => {
       activeRun = null;
       activeController = null;
     });
-}
-
-async function promptRunMode(ui: any, defaultToForeground: boolean = true): Promise<"foreground" | "background"> {
-  if (!ui.hasUI) return defaultToForeground ? "foreground" : "background";
-  const choice = await ui.select("Run mode?", [
-    { name: "Foreground (see live progress)", value: "foreground" },
-    { name: "Background (run in background)", value: "background" },
-  ]);
-  return choice || (defaultToForeground ? "foreground" : "background");
-}
-
-async function runWithMode(orchestrator: GoalOrchestrator, operation: (signal: AbortSignal) => Promise<any>, ui: any, mode: "foreground" | "background"): Promise<void> {
-  if (mode === "foreground") {
-    await runInForeground(orchestrator, operation, ui);
-  } else {
-    runInBackground(orchestrator, operation, ui);
-  }
 }
 
 export default function (pi: ExtensionAPI) {
   // Child Pi processes are isolated workers. They only load the reversible context pruner;
   // orchestration commands stay in the parent process.
-  if (process.env.PI_AUTOGRAPH_CHILD === "1") {
-    pi.on("context", async (event: any, ctx: any) => {
+  if (process.env.PI_AUTOGRAPH_CHILD === "1" || process.env.PI_GOAL_GRAPH_CHILD === "1") {
+    pi.on("context", async (event, ctx) => {
       try {
         const config = loadConfig(pathsFor(ctx.cwd).configFile);
         if (!config.context.reversibleArchive) return;
@@ -116,68 +89,103 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     const o = new GoalOrchestrator(ctx.cwd);
     const goal = o.getActiveGoal();
-    if (goal && goal.status !== "completed") ctx.ui.setStatus("goal-graph", `goal:${goal.status}`);
+    if (goal && goal.status !== "completed" && goal.status !== "cancelled" && goal.status !== "aborted") {
+      ctx.ui.setStatus("goal-graph", `goal:${goal.status}`);
+    }
   });
 
   pi.on("session_shutdown", async () => {
     activeController?.abort();
   });
 
-  function make(cwd: string, ui: any) {
+  function make(cwd: string, ctx: ExtensionCommandContext) {
     return new GoalOrchestrator(cwd, {
-      notify: (message: string, level?: "info" | "success" | "warning" | "error") => ui.notify(message, level),
-      status: (message: string | null) => ui.setStatus?.("goal-graph", message ?? undefined),
-      grill: async (objective: string) => {
-        if (!ui.hasUI) return objective;
-        const confirmed = await ui.confirm("Grill Me: Resolve ambiguities before planning?", objective);
-        if (!confirmed) return null;
-        const refined = await ui.input("Refined objective (press Enter to keep as-is):", objective);
-        return refined?.trim() || objective;
+      notify: (message: string, level?: "info" | "success" | "warning" | "error") => {
+        const mapped = level === "success" ? "info" : level;
+        ctx.ui.notify(message, mapped);
+      },
+      status: (message: string | null) => ctx.ui.setStatus("goal-graph", message ?? undefined),
+      log: (message: string) => {
+        if (ctx.hasUI) ctx.ui.notify(message, "info");
+      },
+      grill: async (objective: string): Promise<string | null> => {
+        if (!ctx.hasUI) return objective;
+        const DECISION_QUESTIONS = [
+          "Any non-negotiable constraints? (tech stack, deadline, scope)",
+          "What does 'done' look like, concretely?",
+          "Anything explicitly out of scope?",
+        ];
+        let refined = objective;
+        for (const q of DECISION_QUESTIONS) {
+          const ans = await ctx.ui.input(q, "Enter constraint or skip with Enter");
+          if (ans === undefined) return null; // user cancelled
+          const trimmed = ans.trim();
+          if (trimmed) refined += `\nConstraint: ${trimmed}`;
+        }
+        const ok = await ctx.ui.confirm("Freeze Goal Contract and start planning?", refined);
+        if (!ok) return null;
+        return refined;
       },
     });
   }
 
-  pi.registerCommand("goal-direct", {
-    description: "Start an autonomous graph goal immediately: /goal-direct <objective>",
-    handler: async (args, ctx) => {
-      const objective = args.trim();
-      if (!objective) { ctx.ui.notify("Usage: /goal-direct <objective>", "warning"); return; }
-      const o = make(ctx.cwd, ctx.ui);
-      // Default to foreground (no prompt)
+  async function startGoal(ctx: ExtensionCommandContext, objective: string, background: boolean): Promise<void> {
+    const o = make(ctx.cwd, ctx);
+    if (background) {
+      runInBackground(o, (signal) => o.start(objective, signal), ctx.ui);
+      ctx.ui.notify("Goal Graph started in background. Use /goal-status to inspect it.", "info");
+    } else {
       await runInForeground(o, (signal) => o.start(objective, signal), ctx.ui);
-      ctx.ui.notify("Goal Graph started in foreground. Use /goal-status to inspect progress.", "info");
-    },
-  });
+    }
+  }
 
   pi.registerCommand("goal", {
-    description: "Confirm and start an autonomous graph goal: /goal <objective>",
+    description: "Confirm and start an autonomous graph goal in foreground: /goal <objective>",
     handler: async (args, ctx) => {
       const objective = args.trim();
       if (!objective) { ctx.ui.notify("Usage: /goal <objective>", "warning"); return; }
       const ok = ctx.hasUI ? await ctx.ui.confirm("Start Goal Graph?", objective) : true;
       if (!ok) return;
-      const o = make(ctx.cwd, ctx.ui);
-      // Default to foreground (no prompt)
-      await runInForeground(o, (signal) => o.start(objective, signal), ctx.ui);
-      ctx.ui.notify("Goal Graph started in foreground. Use /goal-status to inspect progress.", "info");
+      await startGoal(ctx, objective, false);
+    },
+  });
+
+  pi.registerCommand("goal-direct", {
+    description: "Skip confirmation; start an autonomous graph goal in foreground: /goal-direct <objective>",
+    handler: async (args, ctx) => {
+      const objective = args.trim();
+      if (!objective) { ctx.ui.notify("Usage: /goal-direct <objective>", "warning"); return; }
+      await startGoal(ctx, objective, false);
+    },
+  });
+
+  pi.registerCommand("goal-bg", {
+    description: "Start an autonomous graph goal in background: /goal-bg <objective>",
+    handler: async (args, ctx) => {
+      const objective = args.trim();
+      if (!objective) { ctx.ui.notify("Usage: /goal-bg <objective>", "warning"); return; }
+      const ok = ctx.hasUI ? await ctx.ui.confirm("Start Goal Graph in background?", objective) : true;
+      if (!ok) return;
+      await startGoal(ctx, objective, true);
     },
   });
 
   pi.registerCommand("goal-status", {
     description: "Show the active goal, task counts, criteria, and blocker",
     handler: async (_args, ctx) => {
-      const o = make(ctx.cwd, ctx.ui);
+      const o = make(ctx.cwd, ctx);
       const goal = o.getActiveGoal();
       if (!goal) { ctx.ui.notify("No active goal.", "info"); return; }
       const detail = [compactGoalSummary(goal), goal.blockedReason ? `Blocked reason: ${goal.blockedReason}` : "", `Run process: ${activeRun ? "active" : "not active"}`].filter(Boolean).join("\n");
-      ctx.ui.notify(detail, goal.status === "blocked" || goal.status === "failed" ? "warning" : "info");
+      const isProblem = goal.status === "blocked" || goal.status === "failed";
+      ctx.ui.notify(detail, isProblem ? "warning" : "info");
     },
   });
 
   pi.registerCommand("goal-graph", {
     description: "Display the current task DAG and states",
     handler: async (_args, ctx) => {
-      const o = make(ctx.cwd, ctx.ui);
+      const o = make(ctx.cwd, ctx);
       ctx.ui.notify(fmtGraph(o.getActiveGoal()), "info");
     },
   });
@@ -192,77 +200,68 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("goal-resume", {
-    description: "Resume the persisted active goal",
+    description: "Resume the persisted active goal (foreground)",
     handler: async (_args, ctx) => {
-      const o = make(ctx.cwd, ctx.ui);
+      const o = make(ctx.cwd, ctx);
       const goal = o.getActiveGoal();
       if (!goal) { ctx.ui.notify("No persisted goal to resume.", "warning"); return; }
       if (goal.status === "completed") { ctx.ui.notify("The active goal is already completed.", "info"); return; }
-      // Default to foreground (no prompt)
+      if (goal.status === "cancelled" || goal.status === "aborted") {
+        ctx.ui.notify(`Goal ${goal.id} was ${goal.status} and cannot be resumed. Start a new goal with /goal.`, "warning");
+        return;
+      }
       await runInForeground(o, (signal) => o.resume(signal), ctx.ui);
-      ctx.ui.notify(`Resuming ${goal.id}.`, "info");
     },
   });
 
   pi.registerCommand("goal-stop", {
-    description: "Permanently stop the active goal gracefully (marks as failed, non-resumable)",
+    description: "Gracefully stop the active goal permanently (terminal: cancelled)",
     handler: async (_args, ctx) => {
-      const o = make(ctx.cwd, ctx.ui);
+      const o = make(ctx.cwd, ctx);
       const goal = o.getActiveGoal();
       if (!goal) { ctx.ui.notify("No active goal to stop.", "warning"); return; }
-      if (goal.status === "completed") { ctx.ui.notify("Goal already completed.", "info"); return; }
-      
-      // Abort any running process first
+      if (["completed", "cancelled", "aborted"].includes(goal.status)) {
+        ctx.ui.notify(`Goal already ${goal.status}.`, "info");
+        return;
+      }
+      // Abort in-flight workers so the orchestrator catches the signal and pauses cleanly,
+      // then mark the goal as terminal-cancelled.
       if (activeController) {
         activeController.abort();
-        // Wait for the run to settle (it will catch abort and mark paused)
-        if (activeRun) {
-          try { await activeRun; } catch { /* ignore */ }
-        }
+        try { await activeRun; } catch { /* ignore */ }
       }
-      
-      // Mark goal as permanently stopped (failed, non-resumable)
-      goal.status = "failed";
+      goal.status = "cancelled";
       goal.blockedReason = "Stopped by user";
       saveGoal(ctx.cwd, goal);
       appendEvent(ctx.cwd, goal.id, "stopped_by_user", {});
-      ctx.ui.notify(`Goal ${goal.id} stopped permanently.`, "info");
+      ctx.ui.notify(`Goal ${goal.id} cancelled (permanent).`, "info");
     },
   });
 
   pi.registerCommand("goal-kill", {
-    description: "Immediately terminate all goal workers and abort (force kill)",
+    description: "Immediately kill all goal workers and mark the goal aborted",
     handler: async (_args, ctx) => {
-      if (!activeController && !activeRun) { 
-        ctx.ui.notify("No active goal run to kill.", "info"); 
-        return; 
+      if (!activeController && !activeRun) {
+        ctx.ui.notify("No active goal run to kill.", "info");
+        return;
       }
-      
-      // Abort and force-kill: pi-runner will kill child processes on abort
-      if (activeController) {
-        activeController.abort();
+      const controller = activeController;
+      const run = activeRun;
+      if (controller) controller.abort();
+      // Wait for the run promise to settle; if it hangs, we still mark the goal aborted.
+      if (run) {
+        try { await Promise.race([run, new Promise(r => setTimeout(r, 5000))]); } catch { /* ignore */ }
       }
-      
-      // Wait briefly for run to settle, then force reset
-      if (activeRun) {
-        try {
-          await Promise.race([activeRun, new Promise(r => setTimeout(r, 3000))]);
-        } catch { /* ignore */ }
-      }
-      
-      // Mark goal as killed if exists
-      const o = make(ctx.cwd, ctx.ui);
+      const o = make(ctx.cwd, ctx);
       const goal = o.getActiveGoal();
       if (goal && goal.status !== "completed") {
-        goal.status = "failed";
+        goal.status = "aborted";
         goal.blockedReason = "Killed by user";
         saveGoal(ctx.cwd, goal);
         appendEvent(ctx.cwd, goal.id, "killed_by_user", {});
       }
-      
-      // Force reset state
       activeRun = null;
-      activeController = new AbortController();
+      activeController = null;
       ctx.ui.notify("All goal workers killed.", "warning");
     },
   });
@@ -281,7 +280,7 @@ export default function (pi: ExtensionAPI) {
       try {
         config = setConfigPath(config, tokens[1], tokens.slice(2).join(" "));
         saveConfig(p.configFile, config);
-        ctx.ui.notify(`Updated ${tokens[1]}.`, "success");
+        ctx.ui.notify(`Updated ${tokens[1]}.`, "info");
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
@@ -317,51 +316,63 @@ export default function (pi: ExtensionAPI) {
         t.status = "approved";
       } else tools[key].status = "disabled";
       saveTools(p.toolsFile, tools);
-      ctx.ui.notify(`${name}: ${tools[key].status}`, "success");
+      ctx.ui.notify(`${name}: ${tools[key].status}`, "info");
     },
   });
 
   pi.registerCommand("goal-init", {
-    description: "First-run setup: check models, tools, Laya, and save configuration",
+    description: "First-run setup: choose Laya provider, verify tools, save configuration",
     handler: async (_args, ctx) => {
       const p = pathsFor(ctx.cwd);
-      let config = loadConfig(p.configFile);
-      let tools = loadTools(p.toolsFile);
-      const lines: string[] = ["=== Goal Graph Setup ==="];
-      
-      // Check models
-      lines.push("", "Models:", `  Default: ${config.models.default}`, `  Escalation: ${config.models.escalation}`);
-      
-      // Check Laya
-      lines.push("", "Laya Decision Engine:", `  Provider: ${config.decisionEngine.provider}`);
-      if (config.decisionEngine.provider === "laya-local") {
-        lines.push(`  Local model: ${config.decisionEngine.layaLocalModel}`);
-        const nvidiaExists = await executableExists("nvidia", ctx.cwd).catch(() => false);
-        lines.push(`  Local available: ${nvidiaExists ? "yes (NIM)" : "check ollama/llama.cpp"}`);
-      } else if (config.decisionEngine.provider === "laya-hf") {
-        lines.push(`  HF Endpoint: ${config.decisionEngine.layaHFEndpoint || "not set"}`);
-      }
-      lines.push(`  Confidence escalation: < ${config.decisionEngine.confidenceEscalationThreshold}`);
-      
-      // Check tools
-      lines.push("", "External Review Tools:");
-      for (const [name, tool] of Object.entries(tools)) {
-        const installed = await executableExists(tool.executable, ctx.cwd).catch(() => false);
-        lines.push(`  ${name}: ${tool.status} | ${installed ? "installed" : "not found"}`);
-      }
-      
-      // Config details
-      lines.push("", "Current config:", JSON.stringify(config, null, 2).slice(0, 2000));
-      
-      ctx.ui.notify(lines.join("\n"), "info");
+      const config = loadConfig(p.configFile);
+      const tools = loadTools(p.toolsFile);
+
       if (ctx.hasUI) {
-        const save = await ctx.ui.confirm("Apply default configuration?", "Save config for this project?");
-        if (save) {
-          saveConfig(p.configFile, config);
-          saveTools(p.toolsFile, tools);
-          ctx.ui.notify("Configuration saved.", "success");
+        const provider = await ctx.ui.select("Laya decision engine?", [
+          "heuristic (instant, recommended default)",
+          "laya-local (OpenAI-compatible local endpoint, e.g. Ollama)",
+          "laya-hf (Hugging Face Inference Endpoint)",
+          "laya-placeholder (legacy alias for heuristic)",
+        ]);
+        if (provider) {
+          if (provider.startsWith("laya-local")) {
+            config.decisionEngine.provider = "laya-local";
+            const endpoint = await ctx.ui.input("Local endpoint URL", "http://localhost:11434/v1/chat/completions");
+            if (endpoint !== undefined) config.decisionEngine.layaHFEndpoint = endpoint; // reused as generic endpoint URL
+            const model = await ctx.ui.input("Local model name", "nvidia/nemotron-mini-4b-instruct");
+            if (model !== undefined && model.trim()) config.decisionEngine.layaLocalModel = model.trim();
+          } else if (provider.startsWith("laya-hf")) {
+            config.decisionEngine.provider = "laya-hf";
+            const endpoint = await ctx.ui.input("HF Inference Endpoint URL", "https://...");
+            if (endpoint !== undefined) config.decisionEngine.layaHFEndpoint = endpoint;
+            const token = await ctx.ui.input("HF API token (optional)", "hf_...");
+            if (token !== undefined) config.decisionEngine.layaHFToken = token;
+          } else if (provider.startsWith("laya-placeholder")) {
+            config.decisionEngine.provider = "laya-placeholder";
+          } else {
+            config.decisionEngine.provider = "heuristic";
+          }
+        }
+
+        const threshold = await ctx.ui.input("Low-confidence escalation threshold", String(config.decisionEngine.confidenceEscalationThreshold));
+        if (threshold !== undefined) {
+          const n = Number(threshold);
+          if (Number.isFinite(n) && n > 0 && n < 1) config.decisionEngine.confidenceEscalationThreshold = n;
         }
       }
+
+      const lines: string[] = ["=== Goal Graph Setup ===", "", "Models:", `  default: ${config.models.default}`, `  escalation: ${config.models.escalation}`, "", `Decision engine: ${config.decisionEngine.provider} (escalate below confidence ${config.decisionEngine.confidenceEscalationThreshold})`, ""];
+      lines.push("External review tools:");
+      for (const [name, tool] of Object.entries(tools)) {
+        const found = await executableExists(tool.executable, ctx.cwd).catch(() => false);
+        lines.push(`  ${name}: ${tool.status} | ${found ? "installed" : "not found (will skip)"}`);
+      }
+      ctx.ui.notify(lines.join("\n"), "info");
+
+      // Persist once per project
+      saveConfig(p.configFile, config);
+      saveTools(p.toolsFile, tools);
+      ctx.ui.notify("Configuration saved.", "info");
     },
   });
 
@@ -374,7 +385,7 @@ export default function (pi: ExtensionAPI) {
         ["CANDIDATE GLOBAL", loadRules(p.globalCandidateRulesFile)],
         ["ACTIVE GLOBAL", loadRules(p.globalRulesFile)],
       ] as const;
-      const text = sections.map(([label, rules]) => `${label} (${rules.length})\n${rules.length ? rules.map((r) => `- [${r.status} conf=${r.confidence.toFixed(2)} evidence=${r.evidenceCount} projects=${r.projectsSeen.length}] ${r.text}`).join("\n") : "- none"}`).join("\n\n");
+      const text = sections.map(([label, rules]) => `${label} (${rules.length})\n${rules.length ? rules.map((r) => `- [${r.status} conf=${r.confidence.toFixed(2)} ok=${r.successfulUses} fail=${r.failedUses} evidence=${r.evidenceCount} projects=${r.projectsSeen.length}] ${r.text}`).join("\n") : "- none"}`).join("\n\n");
       ctx.ui.notify(text, "info");
     },
   });
