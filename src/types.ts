@@ -229,8 +229,6 @@ export interface GoalGraphConfig {
     retryWorkerOnTransient: number;
     /** Hard spend ceiling for a single goal; null = no budget guard. */
     maxCostUsd: number | null;
-    /** Run goals in background by default (foreground is default for /goal). */
-    runInBackground: boolean;
   };
 }
 
