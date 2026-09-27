@@ -105,10 +105,11 @@ test("extension registers expected Pi commands", () => {
   const fakePi = {
     registerCommand(name: string) { commands.add(name); },
     on(name: string) { events.add(name); },
-  } as any;
+  };
   extension(fakePi);
-  for (const name of ["goal", "goal-direct", "goal-status", "goal-graph", "goal-pause", "goal-resume", "goal-config", "goal-tools", "goal-memory"]) {
-    assert.ok(commands.has(name), `missing ${name}`);
+  const expected = ["goal", "goal-direct", "goal-status", "goal-graph", "goal-pause", "goal-resume", "goal-stop", "goal-kill", "goal-config", "goal-tools", "goal-memory", "goal-init"];
+  for (const name of expected) {
+    assert.ok(commands.has(name), `missing command: ${name}`);
   }
   assert.ok(events.has("session_start"));
   assert.ok(events.has("session_shutdown"));
