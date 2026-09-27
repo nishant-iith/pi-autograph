@@ -40,31 +40,42 @@ export function evidenceSummary(cwd: string, goalId: string, config: GoalGraphCo
   return lines.reverse().join("\n") || "No evidence recorded yet.";
 }
 
-export function compactGoalSummary(goal: GoalContract): string {
+export function compactGoalSummary(cwd: string, goal: GoalContract): string {
   const done = goal.tasks.filter((t) => t.status === "completed").length;
   const pending = goal.tasks.filter((t) => t.status === "pending").length;
   const failed = goal.tasks.filter((t) => t.status === "failed" || t.status === "blocked").length;
   const running = goal.tasks.filter((t) => t.status === "running");
-  
+
   // Elapsed time
   const start = new Date(goal.createdAt).getTime();
   const end = goal.completedAt ? new Date(goal.completedAt).getTime() : Date.now();
-  const elapsedSec = Math.round((end - start) / 1000);
-  const elapsed = elapsedSec >= 3600 ? `${Math.floor(elapsedSec/3600)}h ${Math.floor((elapsedSec%3600)/60)}m` : elapsedSec >= 60 ? `${Math.floor(elapsedSec/60)}m ${elapsedSec%60}s` : `${elapsedSec}s`;
-  
+  const elapsedSec = Math.max(0, Math.round((end - start) / 1000));
+  const elapsed = elapsedSec >= 3600 ? `${Math.floor(elapsedSec / 3600)}h ${Math.floor((elapsedSec % 3600) / 60)}m` : elapsedSec >= 60 ? `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s` : `${elapsedSec}s`;
+
   // Current stage/wave
-  const runningIds = running.map(t => t.id).join(", ") || "none";
+  const runningIds = running.map((t) => t.id).join(", ") || "none";
   const waveIdx = calculateWaveIndex(goal.tasks);
-  
-  // Context usage estimate
-  const totalEvidence = goal.tasks.reduce((acc, t) => acc + (t.rawOutputRef ? 1 : 0), 0);
-  
+
+  // Aggregate real token usage + cost from evidence
+  let totalIn = 0, totalOut = 0, totalCost = 0;
+  try {
+    const evidence = readEvidence(cwd, goal.id);
+    for (const ev of evidence) {
+      const u = (ev.details as Record<string, unknown> | undefined)?.usage as { input?: number; output?: number; cost?: number } | undefined;
+      if (u) {
+        totalIn += typeof u.input === "number" ? u.input : 0;
+        totalOut += typeof u.output === "number" ? u.output : 0;
+        totalCost += typeof u.cost === "number" ? u.cost : 0;
+      }
+    }
+  } catch { /* ignore */ }
+
   const lines = [
     `Goal ${goal.id} [${goal.status}]`,
     goal.immutableObjective,
     `Tasks: ${done} done, ${pending} pending, ${failed} failed, ${running.length} running`,
     `Stage: wave ${waveIdx + 1} | Running: ${runningIds}`,
-    `Elapsed: ${elapsed} | Total tokens: ${goal.tasks.reduce((a,t) => a + (t.modelHistory?.length || 0), 0)}`,
+    `Elapsed: ${elapsed} | Tokens: in=${totalIn} out=${totalOut} cost=$${totalCost.toFixed(4)}`,
     `Criteria: ${goal.acceptanceCriteria.map((a) => `${a.id}:${a.status}`).join(", ")}`,
   ];
   return shortText(lines.join("\n"), 3000);

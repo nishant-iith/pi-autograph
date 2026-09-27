@@ -184,12 +184,15 @@ export function appendGlobalEpisode(cwd: string, episode: Episode): void {
   appendJsonl(idxFile, episode);
 }
 
-export function loadGlobalEvidence(cwd: string, ruleId: string): Episode[] {
+export function loadGlobalEvidence(cwd: string, rule: Lesson): Episode[] {
   const p = pathsFor(cwd);
   const idxFile = path.join(p.globalMemoryDir, "global-episodes.jsonl");
   if (!fs.existsSync(idxFile)) return [];
   const episodes = readJsonl<Episode>(idxFile);
-  return episodes.filter((e) => e.lessons.includes(ruleId) || e.id === ruleId);
+  const ruleText = rule.text.trim().toLowerCase();
+  return episodes.filter((e) =>
+    e.lessons.some((l) => l.trim().toLowerCase() === ruleText) || e.id === rule.id,
+  );
 }
 
 export function loadRecentEpisodes(cwd: string, limit = 20): Episode[] {

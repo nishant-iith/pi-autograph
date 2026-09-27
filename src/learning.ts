@@ -1,6 +1,6 @@
 import * as crypto from "node:crypto";
 import type { Episode, GoalContract, GoalGraphConfig, Lesson } from "./types.ts";
-import { appendEpisode, appendGlobalEpisode, loadRecentEpisodes, loadRules, pathsFor, projectId, saveRules } from "./store.ts";
+import { appendEpisode, appendGlobalEpisode, loadGlobalEvidence, loadRecentEpisodes, loadRules, pathsFor, projectId, saveRules } from "./store.ts";
 
 export interface ReflectedLesson {
   text: string;
@@ -138,6 +138,15 @@ export function addCandidateContradiction(cwd: string, ruleId: string, contradic
 
 export function supportingEpisodeSummaries(cwd: string, rule: Lesson): string[] {
   const episodes = loadRecentEpisodes(cwd, 200);
+  const globalEpisodes = loadGlobalEvidence(cwd, rule);
   const ids = new Set(rule.sourceEpisodeIds);
-  return episodes.filter((e) => ids.has(e.id)).map((e) => `${e.projectId} | ${e.outcome} | ${e.objective}\n${e.summary}`);
+  const all = [...episodes, ...globalEpisodes];
+  const seen = new Set<string>();
+  return all
+    .filter((e) => {
+      if (seen.has(e.id)) return false;
+      seen.add(e.id);
+      return ids.has(e.id);
+    })
+    .map((e) => `${e.projectId} | ${e.outcome} | ${e.objective}\n${e.summary}`);
 }

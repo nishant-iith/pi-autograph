@@ -176,7 +176,7 @@ export default function (pi: ExtensionAPI) {
       const o = make(ctx.cwd, ctx);
       const goal = o.getActiveGoal();
       if (!goal) { ctx.ui.notify("No active goal.", "info"); return; }
-      const detail = [compactGoalSummary(goal), goal.blockedReason ? `Blocked reason: ${goal.blockedReason}` : "", `Run process: ${activeRun ? "active" : "not active"}`].filter(Boolean).join("\n");
+      const detail = [compactGoalSummary(ctx.cwd, goal), goal.blockedReason ? `Blocked reason: ${goal.blockedReason}` : "", `Run process: ${activeRun ? "active" : "not active"}`].filter(Boolean).join("\n");
       const isProblem = goal.status === "blocked" || goal.status === "failed";
       ctx.ui.notify(detail, isProblem ? "warning" : "info");
     },

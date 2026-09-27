@@ -447,8 +447,19 @@ export class GoalOrchestrator {
       const after = goal.tasks.filter((t) => t.status === "completed").length;
       if (after === before) noProgress++; else noProgress = 0;
       if (noProgress >= this.config.execution.maxRepairStrategies) {
+        // Instead of blocking, fall into completion recovery which replans with failure evidence.
+        this.notify("No material progress — triggering completion recovery replan.", "warning");
+        const recheck = await this.runChecks(goal, signal);
+        const startReview = await this.independentReview(goal, recheck, signal);
+        const partialAudit: AuditResult = { pass: false, summary: "strategy exhausted", criteria: [], missingWork: [] };
+        const recovered = await this.completionRecovery(goal, recheck, startReview, partialAudit, signal);
+        if (recovered.pass && !recovered.findings.some((f) => f.blocking)) {
+          // recovery continued progress; reset and continue executing
+          noProgress = 0;
+          continue;
+        }
         goal.status = "blocked";
-        goal.blockedReason = "No material progress across multiple repair strategies.";
+        goal.blockedReason = `No material progress and recovery failed: ${recovered.summary}`;
         saveGoal(this.cwd, goal);
         return;
       }
@@ -658,6 +669,10 @@ export class GoalOrchestrator {
         } else {
           rule.failedUses += 1;
           rule.confidence = Math.max(0, rule.confidence - 0.05);
+          // Demote if failures materially outnumber successes
+          if (this.config.learning.allowAutoDemotion && rule.failedUses >= 2 && rule.failedUses > rule.successfulUses + 1) {
+            rule.status = "deprecated";
+          }
         }
         rule.lastUsed = now();
       }
