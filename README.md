@@ -11,7 +11,9 @@ Plan → critique → parallel dependency waves → deterministic checks → ind
 
 ---
 
-This is an **actual Pi Coding Agent extension/package**. It is not a prompt pack and not a simple `while (!done)` loop. It runs isolated Pi subagents with separate contexts, executes dependency waves in parallel where safe, routes work between NVIDIA Nemotron Super and Ultra, verifies code independently, manages context reversibly, and learns only from **validated** lessons.
+**This is an actual Pi Coding Agent extension/package.** It is not a prompt pack and not a simple `while (!done)` loop. It runs isolated Pi subagents with separate contexts, executes dependency waves in parallel where safe, routes work between NVIDIA Nemotron Super and Ultra, verifies code independently, manages context reversibly, and learns only from **validated** lessons.
+
+**Current version: 0.6.0.** See [CHANGELOG.md](CHANGELOG.md) for what's new.
 
 ```text
 Goal + acceptance contract
