@@ -548,6 +548,45 @@ export class GoalOrchestrator {
     return { pass: false, summary: "Review loop exhausted", findings: [] };
   }
 
+  /**
+   * Completion recovery: after exhausting repair cycles, re-enter Planner with accumulated failure evidence.
+   */
+  private async completionRecovery(goal: GoalContract, checks: CheckResult[], review: ReviewResult, audit: AuditResult, signal?: AbortSignal): Promise<ReviewResult> {
+    const evidence = [
+      `Review: ${review.summary}`,
+      `Audit: ${audit.summary}`,
+      `Missing work: ${normalizeStringArray(audit.missingWork).join("; ")}`,
+      `Failed checks: ${checks.filter(c => c.exitCode !== 0 || c.timedOut).map(c => c.name).join(", ")}`,
+    ].join("\n");
+    const plannerTier = goal.tasks.some(t => t.attempts > 0) ? "ultra" : "super";
+    const prompt = `IMMUTABLE GOAL: ${goal.immutableObjective}\nCurrent tasks:\n${goal.tasks.map(t => `- ${t.id} [${t.status}] ${t.title} (${t.role}/${t.mode})`).join("\n")}\n\nFAILURE EVIDENCE:\n${evidence}\n\nGenerate a REPAIR PLAN: 1-3 new tasks to address ONLY the blocking failures. Prefer different approach. Return ONLY JSON:
+{"summary":"...","acceptanceCriteria":[...],"tasks":[...]}`;
+    const run = await this.runAgent(goal, "planner", prompt, plannerTier, readOnlyTools(), signal);
+    let recoveryPlan: PlanPayload;
+    try { recoveryPlan = extractJson<PlanPayload>(run.output); } catch {
+      return { pass: false, summary: "Recovery planner returned invalid output", findings: [] };
+    }
+    const recoveryTasks = normalizePlan(recoveryPlan, goal.immutableObjective).tasks.map((t, i) => ({
+      ...t,
+      id: `recovery-${i + 1}`,
+      dependencies: [],
+      status: "pending" as const,
+      attempts: 0,
+      modelHistory: [],
+      risk: "high" as const,
+      parallelSafe: false,
+    }));
+    goal.tasks.push(...recoveryTasks);
+    saveGoal(this.cwd, goal);
+    appendEvent(this.cwd, goal.id, "recovery_planning", { newTasks: recoveryTasks.map(t => t.id) });
+    const recoveryWave = buildWave(goal.tasks, 1);
+    for (const task of recoveryWave) {
+      if (task.status !== "pending") continue;
+      await this.executeTask(goal, task, signal);
+    }
+    return this.independentReview(goal, checks, signal);
+  }
+
   private async audit(goal: GoalContract, checks: CheckResult[], review: ReviewResult, signal?: AbortSignal): Promise<AuditResult> {
     let tier: "super" | "ultra" = "super";
     for (let cycle = 0; cycle <= this.config.execution.auditRepairCycles; cycle++) {
@@ -657,19 +696,24 @@ export class GoalOrchestrator {
       }
 
       const review = await this.independentReview(goal, checks, signal);
-      if (!review.pass || review.findings.some((f) => f.blocking)) {
-        goal.status = "blocked";
-        goal.blockedReason = `Independent review still has blocking findings: ${review.summary}`;
-        saveGoal(this.cwd, goal);
-        await this.learn(goal, "blocked", goal.blockedReason, signal);
-        this.status(null);
-        return goal;
+      let finalAudit = await this.audit(goal, checks, review, signal);
+      
+      // If repair cycles exhausted, try completion recovery with fresh plan
+      if (!finalAudit.pass && (goal.status as string) !== "blocked") {
+        this.notify("Repair cycles exhausted. Attempting completion recovery...", "warning");
+        const recoveryReview = await this.completionRecovery(goal, checks, review, finalAudit, signal);
+        if (recoveryReview.pass && !recoveryReview.findings.some((f) => f.blocking)) {
+          const audit2 = await this.audit(goal, checks, recoveryReview, signal);
+          if (audit2.pass) {
+            finalAudit = audit2;
+            this.notify("Recovery succeeded after planner re-entry.", "success");
+          }
+        }
       }
-
-      const audit = await this.audit(goal, checks, review, signal);
-      if (!audit.pass) {
+      
+      if (!finalAudit.pass) {
         goal.status = "blocked";
-        goal.blockedReason = `Completion audit failed: ${audit.summary}`;
+        goal.blockedReason = `Completion audit failed: ${finalAudit.summary}`;
         saveGoal(this.cwd, goal);
         await this.learn(goal, "blocked", goal.blockedReason, signal);
         this.status(null);
@@ -681,7 +725,7 @@ export class GoalOrchestrator {
       goal.blockedReason = undefined;
       saveGoal(this.cwd, goal);
       appendEvent(this.cwd, goal.id, "completed", { gitStatus: await gitStatus(this.cwd) });
-      await this.learn(goal, "success", `Goal verified complete. ${audit.summary}`, signal);
+      await this.learn(goal, "success", `Goal verified complete. ${finalAudit.summary}`, signal);
       this.notify(`Goal ${goal.id} verified complete.`, "success");
       this.status(null);
       return goal;
