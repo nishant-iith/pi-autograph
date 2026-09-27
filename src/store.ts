@@ -178,8 +178,22 @@ export function appendEpisode(cwd: string, episode: Episode): void {
   appendJsonl(pathsFor(cwd).episodesFile, episode);
 }
 
+export function appendGlobalEpisode(cwd: string, episode: Episode): void {
+  const p = pathsFor(cwd);
+  const idxFile = path.join(p.globalMemoryDir, "global-episodes.jsonl");
+  appendJsonl(idxFile, episode);
+}
+
+export function loadGlobalEvidence(cwd: string, ruleId: string): Episode[] {
+  const p = pathsFor(cwd);
+  const idxFile = path.join(p.globalMemoryDir, "global-episodes.jsonl");
+  if (!fs.existsSync(idxFile)) return [];
+  const episodes = readJsonl<Episode>(idxFile);
+  return episodes.filter((e) => e.lessons.includes(ruleId) || e.id === ruleId);
+}
+
 export function loadRecentEpisodes(cwd: string, limit = 20): Episode[] {
-  return readJsonl<Episode>(pathsFor(cwd).episodesFile, limit);
+  return readJsonl<Episode>(pathsFor(cwd).episodesFile, limit).reverse().slice(0, limit);
 }
 
 export function listGoalIds(cwd: string): string[] {

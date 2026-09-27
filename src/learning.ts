@@ -1,6 +1,6 @@
 import * as crypto from "node:crypto";
 import type { Episode, GoalContract, GoalGraphConfig, Lesson } from "./types.ts";
-import { appendEpisode, loadRecentEpisodes, loadRules, pathsFor, projectId, saveRules } from "./store.ts";
+import { appendEpisode, appendGlobalEpisode, loadRecentEpisodes, loadRules, pathsFor, projectId, saveRules } from "./store.ts";
 
 export interface ReflectedLesson {
   text: string;
@@ -67,6 +67,7 @@ export function persistReflection(
     lessons: reflection.lessons.map((l) => l.text),
   };
   appendEpisode(cwd, episode);
+  appendGlobalEpisode(cwd, episode);
 
   const p = pathsFor(cwd);
   const projectRules = loadRules(p.projectRulesFile);

@@ -23,6 +23,7 @@ import {
   pathsFor,
   projectId,
   saveGoal,
+  appendGlobalEpisode,
 } from "./store.ts";
 import { loadRules, saveRules } from "./store.ts";
 import { extractJson, normalizeStringArray, shortText } from "./structured.ts";
