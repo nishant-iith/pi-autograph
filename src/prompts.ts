@@ -1,14 +1,38 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { AgentRole, GoalContract, GoalTask, Lesson } from "./types.ts";
 
 const BASE = `You are a sub-agent inside pi-autograph, an autonomous graph orchestrator for Pi Coding Agent.
 Follow the assigned role exactly. Do not claim success without evidence. Keep outputs concise and decision-useful.
 When JSON is requested, output ONLY valid JSON with no markdown fences.`;
 
-const PONYTAIL = `
-PONYTAIL: Prefer minimal, native, non-overengineered implementations. Use stdlib over deps. No unnecessary abstractions, wrappers, or layers. If 3 lines solve it, do not write 30. Delete dead code. Favor boring solutions.`;
+/** Load a skill's SKILL.md body (frontmatter stripped, intensity/examples tables removed); falls back if missing. */
+function loadSkillPrompt(name: string, fallback: string): string {
+  const candidates = [
+    path.join(os.homedir(), ".agents", "skills", name, "SKILL.md"),
+    path.join(os.homedir(), ".pi", "agent", "skills", name, "SKILL.md"),
+  ];
+  for (const file of candidates) {
+    try {
+      if (!fs.existsSync(file)) continue;
+      let body = fs.readFileSync(file, "utf8").replace(/^---[\s\S]*?---\s*/, "").trim();
+      // For caveman, cut everything from "## Intensity" onwards (modes irrelevant for one-shot subagents).
+      if (name === "caveman") {
+        const cut = body.search(/^##\s+(Intensity|Examples)/im);
+        if (cut > 0) body = body.slice(0, cut).trim();
+      }
+      return `\n${name.toUpperCase()} (skill):\n${body}\n`;
+    } catch { /* ignore */ }
+  }
+  return fallback;
+}
 
-const CAVEMAN = `
-CAVEMAN: Communicate tersely. No fluff, no hedging, no restating the prompt. Exact facts only. Tool calls: minimal params, no redundant context. Responses: decision-useful signal, recoverable if needed.`;
+const PONYTAIL = loadSkillPrompt("ponytail", `
+PONYTAIL: Prefer minimal, native, non-overengineered implementations. Use stdlib over deps. No unnecessary abstractions, wrappers, or layers. If 3 lines solve it, do not write 30. Delete dead code. Favor boring solutions.`);
+
+const CAVEMAN = loadSkillPrompt("caveman", `
+CAVEMAN: Communicate tersely. No fluff, no hedging, no restating the prompt. Exact facts only. Tool calls: minimal params, no redundant context. Responses: decision-useful signal, recoverable if needed.`);
 
 export function systemPrompt(role: AgentRole): string {
   const roleText: Record<AgentRole, string> = {
