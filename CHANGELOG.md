@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.3 — 2026-10-03 — correctness pass
+
+### Fixes
+- **Grill Me is now agent-driven**: instead of "What's ambiguous?" the Grilling subagent searches the codebase with tools, generates the next unknown question, and reports "DONE" when no material ambiguities remain. The grill hook iterates up to 6 questions before freezing the contract.
+- **Laya now parses the real response correctly**: Gradio returns `[dataframe, action string, raw JSON]`. We now correctly pull `action` (e.g., "route to nemotron-super — difficulty 1.57/3") from element [1] instead of trying to extract it from the decision table. Confidence now comes from `answers[].confidence` aggregated, not a hardcoded 0.7/0.65.
+- **Failure classification uses typed-choice Laya**: `classifyFailure` sends the failure output to `/run_playground` with a choice question (debugger / architecture / planner / blocked) and reads the real confidence score from `answers.failure_route.confidence`.
+- **Added missing `fs` import** to `src/index.ts` so `fs.existsSync` works for auto-setup.
+
+### Behavior
+- **Auto-Laya-setup on first `/goal`**: if no `.pi/goal-graph/config.json` exists, the extension asks whether to run the wizard now, then falls back to heuristics until configured.
+
 ## 0.6.2 — 2026-09-28 — proper Laya + Grill Me + race/shutdown fixes
 
 ### Fixes

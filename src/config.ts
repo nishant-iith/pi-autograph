@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { GoalGraphConfig, ToolRegistry } from "./types.ts";
 
 export const DEFAULT_CONFIG: GoalGraphConfig = {
-  version: "0.6.2",
+  version: "0.6.3",
   models: {
     default: "nvidia/nvidia/nemotron-3-super-120b-a12b",
     escalation: "nvidia/nvidia/nemotron-3-ultra-550b-a55b",

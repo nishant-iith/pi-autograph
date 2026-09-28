@@ -1,6 +1,6 @@
 {
   "name": "pi-autograph",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Autonomous multi-agent goal graph for Pi Coding Agent: plan -> critique -> parallel DAG -> deterministic check -> independent review -> completion audit. NVIDIA Nemotron routing, budget + retry circuit breakers, reversible context spills, and validated learning memory.",
   "private": true,
   "type": "module",

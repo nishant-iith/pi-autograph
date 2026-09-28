@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { GoalOrchestrator } from "./orchestrator.ts";
 import { loadConfig, loadTools, saveConfig, saveTools, setConfigPath } from "./config.ts";
@@ -113,24 +114,38 @@ export default function (pi: ExtensionAPI) {
       },
       grill: async (objective: string): Promise<string | null> => {
         if (!ctx.hasUI) return objective;
-        const start = await ctx.ui.confirm("Grill Me: resolve ambiguities before planning?", objective);
+        const start = await ctx.ui.confirm("Grill Me: an agent will inspect the goal and ambiguity to ask questions. Proceed?", objective);
         if (!start) return null;
-        // Iterative questioning
+        // Spawn Pi subagents to find ambiguities using the same runPiAgent that orchestrator uses
+        const { runPiAgent } = await import("./pi-runner.ts");
+        const { pathsFor } = await import("./store.ts");
+        const cfg = loadConfig(pathsFor(ctx.cwd).configFile);
+        
+        const dialogue: Array<{ q: string; a: string }> = [];
         let refined = objective;
-        let more = true;
-        let guard = 0;
-        while (more && guard < 8) {
-          guard++;
-          const question = await ctx.ui.input("What's still ambiguous?", "(or press Enter to stop)");
-          if (question === undefined) return null; // user cancelled
-          const q = question.trim();
-          if (!q) { more = false; break; }
-          const ans = await ctx.ui.input(q, "Your answer");
-          if (ans === undefined) return null;
-          const a = ans.trim();
-          if (a) refined += `\nResolved: ${q} → ${a}`;
-          const wantsMore = await ctx.ui.confirm("More questions?", `Current contract:\n${refined}`);
-          if (!wantsMore) more = false;
+        for (let round = 0; round < 6; round++) {
+          const prompt = dialogue.length
+            ? `Goal:\n${refined}\n\nDialogue:\n${dialogue.map((d) => `Q: ${d.q}\nA: ${d.a}`).join("\n\n")}`
+            : `Goal:\n${refined}`;
+          const result = await runPiAgent({
+            cwd: ctx.cwd,
+            role: "planner",
+            task: prompt + "\n\nFind one material ambiguity. Output exactly one short question, or DONE.",
+            systemPrompt: "You are a Grilling agent. Surface every material unresolved decision. If none, output DONE. Otherwise, one short question.",
+            model: cfg.models.default,
+            modelTier: "super",
+            tools: [],
+            timeoutMs: 30000,
+            piInvocation: (process.env.PI_AUTOGRAPH_FAKE_PI || process.env.PI_GOAL_GRAPH_FAKE_PI) ? { command: process.execPath, args: [(process.env.PI_AUTOGRAPH_FAKE_PI || process.env.PI_GOAL_GRAPH_FAKE_PI)!] } : undefined,
+          });
+          const out = result.output.trim();
+          if (out === "DONE" || out.startsWith("DONE")) break;
+          const answer = await ctx.ui.input(out, "Type your answer (or leave empty to stop)");
+          if (answer === undefined) return null;
+          const a = answer.trim();
+          if (!a) break;
+          dialogue.push({ q: out, a });
+          refined += `\nResolved: ${out} → ${a}`;
         }
         const ok = await ctx.ui.confirm("Freeze Goal Contract and start planning?", refined);
         if (!ok) return null;
@@ -140,6 +155,20 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function startGoal(ctx: ExtensionCommandContext, objective: string, background: boolean): Promise<void> {
+    // Auto-launch /goal-init once per project when config has never been saved.
+    const p = pathsFor(ctx.cwd);
+    const cfg = loadConfig(p.configFile);
+    if (!fs.existsSync(p.configFile) && ctx.hasUI) {
+      const runSetup = await ctx.ui.confirm("First run — run Setup wizard now?", "Configure Laya, models, and tools before starting the goal.");
+      if (runSetup) {
+        await setupWizard(ctx);
+        // Reload after setup
+        const fresh = loadConfig(p.configFile);
+        if (fresh.decisionEngine.provider === "heuristic" || fresh.decisionEngine.provider === "laya-placeholder") {
+          ctx.ui.notify("Using heuristics for task routing. Run /goal-init to configure Laya later.", "info");
+        }
+      }
+    }
     const o = make(ctx.cwd, ctx);
     if (background) {
       runInBackground(o, (signal) => o.start(objective, signal), ctx.ui);
@@ -147,6 +176,53 @@ export default function (pi: ExtensionAPI) {
     } else {
       await runInForeground(o, (signal) => o.start(objective, signal), ctx.ui);
     }
+  }
+
+  async function setupWizard(ctx: ExtensionCommandContext): Promise<void> {
+    const p = pathsFor(ctx.cwd);
+    const config = loadConfig(p.configFile);
+    const tools = loadTools(p.toolsFile);
+
+    if (!ctx.hasUI) return;
+    const provider = await ctx.ui.select("Laya decision engine?", [
+      "heuristic (instant, recommended default)",
+      "laya-local (public Space: convaiinnovations-laya-demo)",
+      "laya-hf (self-hosted/duplicate Gradio Space)",
+      "laya-placeholder (legacy alias for heuristic)",
+    ]);
+    if (provider) {
+      if (provider.startsWith("laya-local")) {
+        config.decisionEngine.provider = "laya-local";
+      } else if (provider.startsWith("laya-hf")) {
+        config.decisionEngine.provider = "laya-hf";
+        const space = await ctx.ui.input("Laya Space URL", "https://convaiinnovations-laya-demo.hf.space");
+        if (space !== undefined) config.decisionEngine.layaSpaceUrl = space;
+        const token = await ctx.ui.input("HF token (optional, for private Spaces)", "");
+        if (token !== undefined) config.decisionEngine.layaHFToken = token;
+      } else if (provider.startsWith("laya-placeholder")) {
+        config.decisionEngine.provider = "laya-placeholder";
+      } else {
+        config.decisionEngine.provider = "heuristic";
+      }
+    }
+
+    const threshold = await ctx.ui.input("Low-confidence escalation threshold (0.5-0.95)", String(config.decisionEngine.confidenceEscalationThreshold));
+    if (threshold !== undefined) {
+      const n = Number(threshold);
+      if (Number.isFinite(n) && n > 0 && n < 1) config.decisionEngine.confidenceEscalationThreshold = n;
+    }
+
+    const lines: string[] = ["=== Goal Graph Setup ===", "", "Models:", `  default: ${config.models.default}`, `  escalation: ${config.models.escalation}`, "", `Decision engine: ${config.decisionEngine.provider} (escalate below confidence ${config.decisionEngine.confidenceEscalationThreshold})`, ""];
+    lines.push("External review tools:");
+    for (const [name, tool] of Object.entries(tools)) {
+      const found = await executableExists(tool.executable, ctx.cwd).catch(() => false);
+      lines.push(`  ${name}: ${tool.status} | ${found ? "installed" : "not found (will skip)"}`);
+    }
+    ctx.ui.notify(lines.join("\n"), "info");
+
+    saveConfig(p.configFile, config);
+    saveTools(p.toolsFile, tools);
+    ctx.ui.notify("Configuration saved.", "info");
   }
 
   pi.registerCommand("goal", {
@@ -334,55 +410,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("goal-init", {
     description: "First-run setup: choose Laya provider, verify tools, save configuration",
     handler: async (_args, ctx) => {
-      const p = pathsFor(ctx.cwd);
-      const config = loadConfig(p.configFile);
-      const tools = loadTools(p.toolsFile);
-
-      if (ctx.hasUI) {
-        const provider = await ctx.ui.select("Laya decision engine?", [
-          "heuristic (instant, recommended default)",
-          "laya-local (public Space: convaiinnovations-laya-demo)",
-          "laya-hf (self-hosted/duplicate Gradio Space)",
-          "laya-placeholder (legacy alias for heuristic)",
-        ]);
-        if (provider) {
-          if (provider.startsWith("laya-local")) {
-            config.decisionEngine.provider = "laya-local";
-          } else if (provider.startsWith("laya-hf")) {
-            config.decisionEngine.provider = "laya-hf";
-            const space = await ctx.ui.input("Laya Space URL", "https://convaiinnovations-laya-demo.hf.space");
-            if (space !== undefined) config.decisionEngine.layaSpaceUrl = space;
-            const token = await ctx.ui.input("HF token (optional, for private Spaces)", "");
-            if (token !== undefined) config.decisionEngine.layaHFToken = token;
-          } else if (provider.startsWith("laya-placeholder")) {
-            config.decisionEngine.provider = "laya-placeholder";
-          } else {
-            config.decisionEngine.provider = "heuristic";
-          }
-        }
-
-        const threshold = await ctx.ui.input("Low-confidence escalation threshold", String(config.decisionEngine.confidenceEscalationThreshold));
-        if (threshold !== undefined) {
-          const n = Number(threshold);
-          if (Number.isFinite(n) && n > 0 && n < 1) config.decisionEngine.confidenceEscalationThreshold = n;
-        }
-      }
-
-      const lines: string[] = ["=== Goal Graph Setup ===", "", "Models:", `  default: ${config.models.default}`, `  escalation: ${config.models.escalation}`, "", `Decision engine: ${config.decisionEngine.provider} (escalate below confidence ${config.decisionEngine.confidenceEscalationThreshold})`, ""];
-      lines.push("External review tools:");
-      for (const [name, tool] of Object.entries(tools)) {
-        const found = await executableExists(tool.executable, ctx.cwd).catch(() => false);
-        lines.push(`  ${name}: ${tool.status} | ${found ? "installed" : "not found (will skip)"}`);
-      }
-      ctx.ui.notify(lines.join("\n"), "info");
-
-      saveConfig(p.configFile, config);
-      saveTools(p.toolsFile, tools);
-      ctx.ui.notify("Configuration saved.", "info");
+      await setupWizard(ctx);
     },
   });
 
-  pi.registerCommand("goal-memory", {
+pi.registerCommand("goal-memory", {
     description: "Inspect learned project/candidate/global rules",
     handler: async (_args, ctx) => {
       const p = pathsFor(ctx.cwd);
