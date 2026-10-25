@@ -155,3 +155,5 @@ framework-free, no auto-installed third parties, and never let one model judgmen
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+<!-- GitHub connector write-access test: 2026-10-25. This test edit is on a separate branch. -->
